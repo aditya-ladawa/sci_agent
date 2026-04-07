@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Local environment and CLI state
+.env
+.env.*
+!.env.example
+.cli_history
+
+# Agent runtime artifacts
+THREADS/
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
+.playwright-mcp/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+

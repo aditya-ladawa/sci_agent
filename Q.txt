@@ -1,0 +1,123 @@
+Below is a replacement set designed to be substantially deeper, interdisciplinary, and conceptually demanding. Each prompt pushes beyond standard descriptive analysis and requires advanced modeling, theoretical synthesis, and non-trivial visualizations (e.g., phase spaces, wavefunctions, manifolds, attractors, network graphs).
+
+---
+
+### 1. Quantum Measurement & Reality Construction
+
+Investigate the measurement problem in quantum mechanics across interpretations (Copenhagen, Many-Worlds, QBism, Relational QM). Develop a comparative framework and generate visualizations of wavefunction collapse vs branching vs observer-dependent states, including probability amplitude evolution in Hilbert space.
+
+---
+
+### 2. Emergence of Consciousness as a Complex System
+
+Model consciousness as an emergent phenomenon from neural networks using integrated information theory (IIT), global workspace theory, and predictive processing. Produce phase diagrams, attractor landscapes, and information flow graphs across brain regions.
+
+---
+
+### 3. Time: Physical vs Psychological
+
+Analyze the discrepancy between physical time (relativity, entropy) and perceived time (neuroscience, cognition). Build models showing subjective time dilation under emotional and cognitive load, with spacetime diagrams vs neural temporal encoding plots.
+
+---
+
+### 4. Quantum Entanglement & Information Geometry
+
+Explore entanglement entropy, quantum mutual information, and tensor networks. Visualize entanglement structures using graph embeddings and geometric representations of quantum states.
+
+---
+
+### 5. Human Decision-Making Under Uncertainty
+
+Integrate behavioral economics, Bayesian cognition, and reinforcement learning. Model irrationality as bounded optimality and visualize belief updates, utility landscapes, and decision trajectories in high-dimensional spaces.
+
+---
+
+### 6. Chaos, Free Will, and Determinism
+
+Examine whether deterministic chaos can produce effective free will. Use Lorenz attractors, phase space diagrams, and sensitivity-to-initial-conditions visualizations to connect physics with philosophical agency.
+
+---
+
+### 7. Evolution of Intelligence (Biological → Artificial)
+
+Study intelligence as an optimization process across evolution, brains, and AI systems. Compare fitness landscapes, loss surfaces, and scaling laws with visualizations of convergence and divergence.
+
+---
+
+### 8. Memory as Reconstruction, Not Storage
+
+Analyze human memory through predictive coding and reconstruction theory. Create network diagrams of memory distortion, temporal decay curves, and simulation of false memory formation.
+
+---
+
+### 9. Quantum Thermodynamics & Arrow of Time
+
+Investigate entropy, irreversibility, and information loss at quantum scales. Visualize entropy evolution, phase transitions, and microstate distributions.
+
+---
+
+### 10. Social Networks as Dynamic Complex Systems
+
+Model belief formation, polarization, and information cascades using graph theory and dynamical systems. Generate network evolution plots, echo chamber formation, and tipping point thresholds.
+
+---
+
+### 11. Neural Representations & Latent Spaces
+
+Compare how brains and deep neural networks encode information. Visualize latent manifolds, dimensionality reduction (t-SNE/UMAP), and representational similarity.
+
+---
+
+### 12. Existential Risk & Long-Term Futures Modeling
+
+Integrate AI risk, climate tipping points, bio-risk, and geopolitical instability into a unified probabilistic model. Produce scenario trees, risk surfaces, and cascading failure simulations.
+
+---
+
+### 13. Emotion as a Control System
+
+Model emotions as feedback mechanisms in a control system regulating behavior. Visualize state transitions, stability regions, and control loops.
+
+---
+
+### 14. Quantum Field Theory Intuition via Visualization
+
+Explain particle interactions using field excitations. Create spacetime diagrams, Feynman diagrams, and wavefunction field visualizations.
+
+---
+
+### 15. Cognitive Biases as Evolutionary Heuristics
+
+Reframe biases (confirmation bias, loss aversion) as adaptive shortcuts. Model their benefits vs failures across environments using payoff landscapes.
+
+---
+
+### 16. Language, Thought, and Reality Construction
+
+Explore whether language shapes cognition (Sapir-Whorf hypothesis) using embedding spaces, semantic networks, and cross-linguistic conceptual mappings.
+
+---
+
+### 17. Multiverse Theories & Cosmological Landscapes
+
+Compare inflationary multiverse, string landscape, and many-worlds. Visualize probability distributions across universes and parameter spaces.
+
+---
+
+### 18. Collective Intelligence vs Individual Intelligence
+
+Model how groups outperform or fail compared to individuals. Use swarm intelligence, consensus algorithms, and network decision-making visualizations.
+
+---
+
+### 19. Attention as a Scarce Computational Resource
+
+Study attention in brains and transformers. Compare attention maps, saliency distributions, and energy allocation models.
+
+---
+
+### 20. Identity as a Dynamic Process
+
+Analyze personal identity through neuroscience, psychology, and philosophy. Model identity as a time-evolving state vector with continuity/disruption events.
+
+---
