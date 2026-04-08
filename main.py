@@ -1,5 +1,7 @@
 import asyncio
+import ast
 import base64
+import json
 import mimetypes
 import os
 import readline
@@ -13,7 +15,7 @@ from daytona import CreateSandboxFromSnapshotParams, Daytona, DaytonaConfig
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization import SummarizationMiddleware, SummarizationToolMiddleware
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
@@ -25,7 +27,8 @@ from langchain.agents.middleware import (
     wrap_model_call,
 )
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
-from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
+from langchain_core.exceptions import ContextOverflowError
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_daytona import DaytonaSandbox
 from langchain_openai import ChatOpenAI
@@ -46,7 +49,7 @@ load_dotenv()
 DEFAULT_PROMPT = "What time is it right now?"
 CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", "checkpoints.db")
 
-THREAD_ID = os.getenv("THREAD_ID", "t23")
+THREAD_ID = os.getenv("THREAD_ID")
 AI_MODEL_MULTIMODAL = os.getenv("AI_MODEL_MULTIMODAL", "false").lower() == "true"
 
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL")
@@ -57,6 +60,10 @@ DAYTONA_AUTO_DELETE_INTERVAL = int(os.getenv("DAYTONA_AUTO_DELETE_INTERVAL", "86
 LOCAL_THREAD_ROOT = Path(os.getenv("LOCAL_THREAD_ROOT", "THREADS")) / THREAD_ID
 SANDBOX_ARTIFACT_SUBDIR = os.getenv("SANDBOX_ARTIFACT_SUBDIR", "sandbox_artifacts")
 SANDBOX_UPLOAD_SUBDIR = os.getenv("SANDBOX_UPLOAD_SUBDIR", "uploads")
+RESEARCH_SUMMARY_TRIGGER_TOKENS = int(os.getenv("RESEARCH_SUMMARY_TRIGGER_TOKENS", "60000"))
+RESEARCH_TRUNCATE_ARGS_TRIGGER_TOKENS = int(os.getenv("RESEARCH_TRUNCATE_ARGS_TRIGGER_TOKENS", "30000"))
+RESEARCH_TRUNCATE_ARGS_MAX_LENGTH = int(os.getenv("RESEARCH_TRUNCATE_ARGS_MAX_LENGTH", "600"))
+RESEARCH_TOOL_EVICT_TOKENS = int(os.getenv("RESEARCH_TOOL_EVICT_TOKENS", "20000"))
 SANDBOX_HOME = Path("/home/daytona")
 SANDBOX_WORK_ROOT = SANDBOX_HOME / "workspace" / THREAD_ID
 SANDBOX_UPLOAD_ROOT = SANDBOX_HOME / SANDBOX_UPLOAD_SUBDIR / THREAD_ID
@@ -86,6 +93,19 @@ DDGS_TOOL_NAMES = [
     "search_books",
     "extract_content",
 ]
+TASK_TOOL_NAMES = {"task"}
+CODE_ACTIVITY_TOOL_NAMES = {
+    "execute",
+    "write_file",
+    "edit_file",
+    "read_file",
+    "ls",
+    "glob",
+    "grep",
+    "download_sandbox_files",
+}
+LIVE_TOOL_CALL_NAMES = TASK_TOOL_NAMES | CODE_ACTIVITY_TOOL_NAMES
+LIVE_TOOL_RESULT_NAMES = {"task", "execute", "write_file", "edit_file", "read_file", "download_sandbox_files"}
 
 
 class FilesOnlyBackend:
@@ -96,6 +116,34 @@ class FilesOnlyBackend:
 
     def __getattr__(self, name: str):
         return getattr(self._backend, name)
+
+
+def is_provider_context_overflow(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "maximum context length" in text
+        or "context length" in text
+        or "too many tokens" in text
+        or ("requested about" in text and "tokens" in text)
+    )
+
+
+def make_context_overflow_adapter():
+    @wrap_model_call
+    async def adapt_context_overflow(
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        try:
+            return await handler(request)
+        except ContextOverflowError:
+            raise
+        except Exception as exc:
+            if is_provider_context_overflow(exc):
+                raise ContextOverflowError(str(exc)) from exc
+            raise
+
+    return adapt_context_overflow
 
 
 def get_model(model_env: str, temperature_env: str) -> ChatOpenAI:
@@ -177,6 +225,99 @@ def todo_label() -> str:
 
 def upload_label(name: str) -> str:
     return style(f"[{name}]", ANSI_BOLD, ANSI_GREEN)
+
+
+def args_line(text: str) -> str:
+    return style(f"args: {text}", ANSI_GRAY)
+
+
+def format_todo_update(content: object) -> str:
+    if isinstance(content, str):
+        raw = content.strip()
+        try:
+            parsed = ast.literal_eval(raw)
+        except Exception:
+            return raw or "updated"
+    else:
+        parsed = content
+
+    if not isinstance(parsed, list):
+        return str(content).strip() or "updated"
+
+    status_labels = {
+        "completed": "done",
+        "in_progress": "doing",
+        "pending": "todo",
+    }
+
+    lines: list[str] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            lines.append(f"- {item}")
+            continue
+
+        task_text = str(item.get("content", "")).strip() or "<unnamed task>"
+        status = status_labels.get(str(item.get("status", "")).strip(), str(item.get("status", "")).strip() or "todo")
+        lines.append(f"- [{status}] {task_text}")
+
+    return "\n".join(lines) if lines else "updated"
+
+
+def truncate_text(text: str, limit: int = 240) -> str:
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def is_complete_tool_args(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def format_live_tool_args(tool_name: str, raw_args: str, limit: int = 800) -> str:
+    raw_args = raw_args.strip()
+    if not raw_args:
+        return ""
+
+    try:
+        parsed = json.loads(raw_args)
+    except Exception:
+        return truncate_text(raw_args, limit)
+
+    if tool_name == "task" and isinstance(parsed, dict):
+        subagent = (
+            parsed.get("subagent_type")
+            or parsed.get("subagent")
+            or parsed.get("agent")
+            or parsed.get("name")
+        )
+        summary = (
+            parsed.get("description")
+            or parsed.get("task_description")
+            or parsed.get("prompt")
+            or parsed.get("input")
+        )
+        if isinstance(summary, str) and summary.strip():
+            if isinstance(subagent, str) and subagent.strip():
+                return truncate_text(f"[{subagent}] {summary}", limit)
+            return truncate_text(summary, limit)
+        return truncate_text(json.dumps(parsed, ensure_ascii=True), limit)
+
+    if tool_name == "execute" and isinstance(parsed, dict):
+        command = parsed.get("command") or parsed.get("cmd")
+        if isinstance(command, str) and command.strip():
+            return truncate_text(command, limit)
+        return truncate_text(json.dumps(parsed, ensure_ascii=True), limit)
+
+    return truncate_text(json.dumps(parsed, ensure_ascii=True), limit)
 
 
 def _content_is_multimodal(content: object) -> bool:
@@ -362,12 +503,28 @@ async def build_agent():
     mm_model = get_model("MM_MODEL", "AI_MODEL_TEMPERATURE") if os.getenv("MM_MODEL") else None
     main_model_router = make_model_router(main_model, mm_model)
     sub_model_router = make_model_router(sub_model, mm_model)
+    context_overflow_adapter = make_context_overflow_adapter()
     summary_model = mm_model or main_model
     ddgs_tools = await get_mcp_tools()
     sandbox_backend = get_daytona_backend()
     ensure_sandbox_layout(sandbox_backend)
     main_files_backend = FilesOnlyBackend(sandbox_backend)
+    research_files_backend = FilesOnlyBackend(sandbox_backend)
     local_tools = [*get_local_tools(), make_download_sandbox_files_tool(sandbox_backend)]
+
+    research_summarization = SummarizationMiddleware(
+        model=summary_model,
+        backend=sandbox_backend,
+        trigger=("tokens", RESEARCH_SUMMARY_TRIGGER_TOKENS),
+        keep=("messages", 20),
+        history_path_prefix=str(SANDBOX_HISTORY_ROOT),
+        truncate_args_settings={
+            "trigger": ("tokens", RESEARCH_TRUNCATE_ARGS_TRIGGER_TOKENS),
+            "keep": ("messages", 20),
+            "max_length": RESEARCH_TRUNCATE_ARGS_MAX_LENGTH,
+            "truncation_text": "...(argument truncated; see prior file/tool artifacts if needed)",
+        },
+    )
 
     research_subagent = {
         "name": "general-purpose",
@@ -377,11 +534,13 @@ async def build_agent():
         "tools": ddgs_tools,
         "middleware": [
             sub_model_router,
-            SummarizationMiddleware(
-                model=summary_model,
-                backend=sandbox_backend,
-                history_path_prefix=str(SANDBOX_HISTORY_ROOT),
+            FilesystemMiddleware(
+                backend=research_files_backend,
+                tool_token_limit_before_evict=RESEARCH_TOOL_EVICT_TOKENS,
             ),
+            research_summarization,
+            context_overflow_adapter,
+            SummarizationToolMiddleware(research_summarization),
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             PatchToolCallsMiddleware(),
             ToolRetryMiddleware(
@@ -414,6 +573,7 @@ async def build_agent():
                 backend=sandbox_backend,
                 history_path_prefix=str(SANDBOX_HISTORY_ROOT),
             ),
+            context_overflow_adapter,
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             PatchToolCallsMiddleware(),
             ToolRetryMiddleware(
@@ -445,6 +605,7 @@ async def build_agent():
             backend=sandbox_backend,
             history_path_prefix=str(SANDBOX_HISTORY_ROOT),
         ),
+        context_overflow_adapter,
         AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
         PatchToolCallsMiddleware(),
         ToolRetryMiddleware(
@@ -591,9 +752,13 @@ async def main() -> None:
         async def run_turn(user_content: str | list[dict[str, str]]) -> None:
             current_agent = None
             seen_tool_calls: set[tuple[str, str]] = set()
-            stream_modes = ["messages"]
-            if CLI_SHOW_TODOS or CLI_VERBOSE_TOOLS:
-                stream_modes.append("updates")
+            seen_completed_tool_calls: set[str] = set()
+            printed_tool_args: set[tuple[str, str]] = set()
+            tool_call_args_buffer: dict[tuple[str, str], str] = {}
+            tool_call_names: dict[tuple[str, str], str] = {}
+            seen_tool_messages: set[tuple[str, str]] = set()
+            reasoning_blocks_seen: dict[tuple[str, str], str] = {}
+            stream_modes = ["messages", "updates"]
 
             async for chunk in agent.astream(
                 {"messages": [{"role": "user", "content": user_content}]},
@@ -603,32 +768,64 @@ async def main() -> None:
                 version="v2",
             ):
                 if chunk["type"] == "updates":
-                    if not (CLI_SHOW_TODOS or CLI_VERBOSE_TOOLS):
-                        continue
-
-                    for data in chunk["data"].values():
-                        messages = data.get("messages", []) if isinstance(data, dict) else []
-                        if hasattr(messages, "value"):
-                            messages = messages.value
-                        if not isinstance(messages, list):
+                    for source, data in chunk["data"].items():
+                        if not isinstance(data, dict):
                             continue
 
-                        for message in messages:
-                            if not isinstance(message, ToolMessage):
-                                continue
+                        messages = data.get("messages", [])
+                        if hasattr(messages, "value"):
+                            messages = messages.value
+                        if not isinstance(messages, list) or not messages:
+                            continue
 
-                            if message.name == "write_todos":
-                                if not CLI_SHOW_TODOS:
+                        message = messages[-1]
+
+                        if isinstance(message, AIMessage):
+                            for tool_call in getattr(message, "tool_calls", []):
+                                tool_name = tool_call.get("name")
+                                tool_call_id = tool_call.get("id")
+                                if not tool_name or tool_name not in LIVE_TOOL_CALL_NAMES or not tool_call_id:
                                     continue
-                                print(f"\n{todo_label()} {message.content}")
-                                continue
+                                if tool_call_id in seen_completed_tool_calls:
+                                    continue
 
-                            if not CLI_VERBOSE_TOOLS:
-                                continue
+                                seen_completed_tool_calls.add(tool_call_id)
+                                if tool_name == "task":
+                                    args_text = format_live_tool_args(
+                                        tool_name,
+                                        json.dumps(tool_call.get("args", {}), ensure_ascii=True),
+                                        800,
+                                    )
+                                    if args_text:
+                                        print(args_line(args_text))
+                            continue
 
-                            tool_output = format_tool_output(message.content)
-                            if tool_output:
-                                print(f"\n{tool_label(message.name)} {tool_output}")
+                        if not isinstance(message, ToolMessage):
+                            continue
+
+                        message_key = (
+                            source,
+                            message.name,
+                            message.id or message.tool_call_id or truncate_text(str(message.content), 120),
+                        )
+                        if message_key in seen_tool_messages:
+                            continue
+                        seen_tool_messages.add(message_key)
+
+                        if message.name == "write_todos":
+                            todo_text = format_todo_update(message.content)
+                            print(f"\n{todo_label()}\n{todo_text}")
+                            continue
+
+                        if message.name not in LIVE_TOOL_RESULT_NAMES:
+                            continue
+
+                        if not CLI_VERBOSE_TOOLS and message.name != "task":
+                            continue
+
+                        tool_output = format_tool_output(message.content)
+                        if tool_output:
+                            print(f"\n{tool_label(message.name)} {tool_output}")
                     continue
 
                 if chunk["type"] != "messages":
@@ -648,32 +845,81 @@ async def main() -> None:
                 if CLI_SHOW_TOOL_CALLS and token.tool_call_chunks:
                     for tool_call in token.tool_call_chunks:
                         tool_name = tool_call.get("name")
-                        if not tool_name:
-                            continue
-
-                        tool_id = tool_call.get("id") or f"{agent_name}:{tool_name}:{tool_call.get('index', 0)}"
+                        tool_id = tool_call.get("id") or f"{agent_name}:{tool_call.get('index', 0)}"
                         key = (agent_name, tool_id)
                         args = tool_call.get("args")
+                        if tool_name:
+                            tool_call_names[key] = tool_name
+                        else:
+                            tool_name = tool_call_names.get(key)
+
+                        if not tool_name or tool_name not in LIVE_TOOL_CALL_NAMES:
+                            continue
+
+                        if args:
+                            tool_call_args_buffer[key] = tool_call_args_buffer.get(key, "") + str(args)
 
                         if key in seen_tool_calls:
+                            if (
+                                key not in printed_tool_args
+                                and (CLI_VERBOSE_TOOLS or tool_name == "task" or tool_name == "execute")
+                                and is_complete_tool_args(tool_call_args_buffer.get(key, ""))
+                            ):
+                                print(
+                                    args_line(format_live_tool_args(tool_name, tool_call_args_buffer[key], 800))
+                                )
+                                printed_tool_args.add(key)
                             continue
 
                         seen_tool_calls.add(key)
                         print(style(f"[tool] {tool_name}", ANSI_DIM, ANSI_BLUE))
-                        if CLI_VERBOSE_TOOLS and args:
-                            print(style(f"args: {args}", ANSI_DIM, ANSI_GRAY))
+                        if (
+                            key not in printed_tool_args
+                            and (CLI_VERBOSE_TOOLS or tool_name == "task" or tool_name == "execute")
+                            and is_complete_tool_args(tool_call_args_buffer.get(key, ""))
+                        ):
+                            print(
+                                args_line(format_live_tool_args(tool_name, tool_call_args_buffer[key], 800))
+                            )
+                            printed_tool_args.add(key)
 
-                for block in token.content_blocks:
-                    if block["type"] == "reasoning":
-                        if not CLI_SHOW_REASONING:
+                text = str(token.text)
+                if text:
+                    print(text, end="", flush=True)
+
+                if CLI_SHOW_REASONING:
+                    for block in token.content_blocks:
+                        if block["type"] != "reasoning":
                             continue
                         reasoning = block.get("reasoning") or block.get("text")
-                        if reasoning:
-                            print(reasoning, end="", flush=True)
-                    elif block["type"] == "text":
-                        text = block.get("text")
-                        if text:
-                            print(text, end="", flush=True)
+                        if not reasoning:
+                            continue
+
+                        block_key = (
+                            agent_name,
+                            str(block.get("id") or block.get("index") or "reasoning"),
+                        )
+                        previous = reasoning_blocks_seen.get(block_key, "")
+                        if reasoning.startswith(previous):
+                            delta = reasoning[len(previous) :]
+                        elif reasoning == previous:
+                            delta = ""
+                        else:
+                            delta = reasoning
+
+                        if delta:
+                            print(delta, end="", flush=True)
+                        reasoning_blocks_seen[block_key] = reasoning
+
+            for key, buffered_args in tool_call_args_buffer.items():
+                if key in printed_tool_args or not buffered_args:
+                    continue
+
+                tool_name = tool_call_names.get(key)
+                if tool_name not in {"task", "execute"} and not CLI_VERBOSE_TOOLS:
+                    continue
+
+                print(args_line(format_live_tool_args(tool_name or "tool", buffered_args, 800)))
 
             print("\n")
 
