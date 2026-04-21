@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.langgraph
+.env
+
+client_secret_1048293831853-9mrhsufeb2modfltb0hokjklv29r7pju.apps.googleusercontent.com.json
