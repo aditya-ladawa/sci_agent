@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -19,6 +20,34 @@ DEFAULT_PARAMETERS = {
     "search_depth": "advanced",
     "max_results": 10,
 }
+MCP_CONNECT_RETRIES = 3
+MCP_CONNECT_INITIAL_DELAY_SECONDS = 2.0
+
+
+def _format_mcp_error(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}"
+
+
+def _augment_tool_description(tool: BaseTool) -> BaseTool:
+    description = getattr(tool, "description", "") or ""
+    guidance = (
+        "\n\nReliability guidance for agents: if this Tavily Internet Search MCP tool "
+        "returns an error, empty result, inaccessible page, or low-quality output, preserve "
+        "the exact error/result in your notes, use think_tool, then retry with a changed "
+        "query/source strategy or mark the evidence gap explicitly. Do not infer missing facts."
+    )
+    updated_description = description + guidance
+    if hasattr(tool, "model_copy"):
+        return tool.model_copy(update={"description": updated_description})
+    try:
+        tool.description = updated_description
+    except Exception:
+        return tool
+    return tool
+
+
+def _augment_tavily_tools(tools: list[BaseTool]) -> list[BaseTool]:
+    return [_augment_tool_description(tool) for tool in tools]
 
 
 @dataclass(slots=True, frozen=True)
@@ -81,28 +110,66 @@ def build_tavily_mcp_client(
 async def get_tavily_mcp_tools(
     config: TavilyMCPConfig | None = None,
 ) -> list[BaseTool]:
-    """Load Tavily tools with the adapter's default stateless async sessions."""
+    """Load Tavily Internet Search MCP tools with the adapter's default stateless async sessions."""
 
     client = build_tavily_mcp_client(config)
-    return await client.get_tools()
+    try:
+        return _augment_tavily_tools(await client.get_tools())
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to load Tavily Internet Search MCP tools via stateless session: "
+            + _format_mcp_error(error)
+        ) from error
 
 
 @asynccontextmanager
 async def tavily_mcp_tools(
     config: TavilyMCPConfig | None = None,
 ) -> AsyncIterator[list[BaseTool]]:
-    """Yield Tavily tools bound to one persistent async MCP session."""
+    """Yield Tavily Internet Search MCP tools bound to one persistent async MCP session."""
 
     resolved_config = config or TavilyMCPConfig.from_env()
     client = build_tavily_mcp_client(resolved_config)
 
-    async with client.session("tavily") as session:
-        tools = await load_mcp_tools(session)
+    session_context: Any | None = None
+    session: Any | None = None
+    tools: list[BaseTool] | None = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, MCP_CONNECT_RETRIES + 1):
+        try:
+            session_context = client.session("tavily")
+            session = await session_context.__aenter__()
+            tools = _augment_tavily_tools(await load_mcp_tools(session))
+            break
+        except Exception as error:
+            last_error = error
+            if session_context is not None:
+                try:
+                    await session_context.__aexit__(type(error), error, error.__traceback__)
+                except Exception:
+                    pass
+            session_context = None
+            session = None
+            if attempt < MCP_CONNECT_RETRIES:
+                await asyncio.sleep(MCP_CONNECT_INITIAL_DELAY_SECONDS * attempt)
+
+    if tools is None or session_context is None or session is None:
+        detail = _format_mcp_error(last_error) if last_error else "unknown error"
+        raise RuntimeError(
+            f"Failed to establish Tavily Internet Search MCP session after {MCP_CONNECT_RETRIES} attempts: {detail}"
+        )
+
+    try:
         yield tools
+    finally:
+        await session_context.__aexit__(None, None, None)
 
 
 __all__ = [
     "DEFAULT_PARAMETERS",
+    "MCP_CONNECT_INITIAL_DELAY_SECONDS",
+    "MCP_CONNECT_RETRIES",
     "TAVILY_REMOTE_MCP_URL",
     "TavilyMCPConfig",
     "build_tavily_mcp_client",

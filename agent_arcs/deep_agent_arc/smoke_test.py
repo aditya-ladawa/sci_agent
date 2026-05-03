@@ -23,7 +23,7 @@ from agent_arcs.deep_agent_arc.deep_agent_arch import REPORTS_DIR, WORKSPACE_ROO
 DEFAULT_PROMPT = "Write a concise note on how Model context protocol works, ue only 3 todos at max"
 
 DEFAULT_THREAD_ID = "deep-agent-smoke-test35"
-RUN_METRICS_DIR = REPORTS_DIR / "run_metrics"
+RUN_METRICS_DIR = WORKSPACE_ROOT / "run_metrics"
 
 
 USE_COLOR = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
@@ -71,6 +71,16 @@ def _truncate(text: str, limit: int = 220) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def _report_placeholder_issues(article_text: str) -> list[str]:
+    lowered = article_text.lower()
+    checks = {
+        "contains unfinished-section placeholder": "will be completed after all research",
+        "contains unfinished-references placeholder": "references will be populated",
+        "contains generic placeholder marker": "*this section will be completed",
+    }
+    return [label for label, needle in checks.items() if needle in lowered]
 
 
 def _format_todos(content: object) -> str:
@@ -155,6 +165,33 @@ def _resolve_virtual_path(path_str: str) -> Path:
     return WORKSPACE_ROOT / normalized
 
 
+def _prompt_with_run_metadata(
+    *,
+    prompt: str,
+    thread_id: str,
+    expected_report_path: str | None,
+) -> str:
+    report_path = expected_report_path or "/report/final_report.md"
+    metadata = f"""\
+<run_metadata>
+LangGraph thread_id: {thread_id}
+Physical workspace root: {WORKSPACE_ROOT}
+Virtual workspace root for agent tools: /
+Virtual large tool result directory: /large_tool_results/
+Virtual draft directory: /tmp/drafts/
+Virtual review directory: /tmp/review/
+Virtual final report path: {report_path}
+
+Use virtual absolute paths with filesystem tools. Do not use the physical workspace root in
+tool calls. When delegating to subagents, include the thread_id and the expected direct handoff
+format in the task description. Subagents should return findings directly; use /tmp/drafts/ only
+for unusually large supplementary appendices. Use /tmp/review/ for coverage and citation audits. If a tool result is automatically offloaded to
+/large_tool_results/<tool_call_id>, read_file or grep that path before relying on the result.
+</run_metadata>
+"""
+    return metadata + "\n" + prompt
+
+
 def _save_run_metrics(
     *,
     run_id: str,
@@ -202,7 +239,13 @@ async def _stream_run(
     thread_id: str,
     *,
     expected_report_path: str | None = None,
+    fail_on_incomplete_report: bool = True,
 ) -> StreamRunResult:
+    agent_prompt = _prompt_with_run_metadata(
+        prompt=prompt,
+        thread_id=thread_id,
+        expected_report_path=expected_report_path,
+    )
     current_agent: str | None = None
     root_run_id: str | None = None
     shown_tool_calls: set[tuple[str, str]] = set()
@@ -221,7 +264,7 @@ async def _stream_run(
 
     async with build_deep_research_agent() as agent:
         async for event in agent.astream_events(
-            {"messages": [{"role": "user", "content": prompt}]},
+            {"messages": [{"role": "user", "content": agent_prompt}]},
             config={
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": 10_000,
@@ -291,7 +334,7 @@ async def _stream_run(
                     and isinstance(tool_input, dict)
                 ):
                     file_path = tool_input.get("file_path")
-                    if isinstance(file_path, str) and file_path.startswith("/reports/") and file_path.endswith(".md"):
+                    if isinstance(file_path, str) and file_path.startswith("/report/") and file_path.endswith(".md"):
                         report_file_candidates.append(_resolve_virtual_path(file_path))
                 if tool_name.startswith("tavily_"):
                     tavily_call_counts[tool_name] += 1
@@ -356,7 +399,7 @@ async def _stream_run(
         metrics_path = _save_run_metrics(
             run_id=metrics_run_id,
             thread_id=thread_id,
-            prompt=prompt,
+            prompt=agent_prompt,
             token_usage_by_agent=dict(token_usage_by_agent),
             tavily_call_counts=dict(tavily_call_counts),
         )
@@ -376,6 +419,14 @@ async def _stream_run(
         article_text = ""
         if report_path is not None:
             article_text = report_path.read_text(encoding="utf-8")
+            if expected_report_path:
+                placeholder_issues = _report_placeholder_issues(article_text)
+                if placeholder_issues:
+                    issue_text = "; ".join(placeholder_issues)
+                    message = f"Report at {report_path} is still a skeleton: {issue_text}"
+                    if fail_on_incomplete_report:
+                        raise RuntimeError(message)
+                    print(_style(f"WARNING: {message}", BOLD, YELLOW))
         for candidate in reversed(completed_model_text.get("main-agent", [])):
             if not article_text and candidate.strip():
                 article_text = candidate
