@@ -12,7 +12,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -20,9 +19,9 @@ if str(PROJECT_ROOT) not in sys.path:
 DR_BENCH_ROOT = PROJECT_ROOT / "dr_bench"
 BENCH_CODE_ROOT = PROJECT_ROOT / "deep_research_bench"
 QUERY_FILE = BENCH_CODE_ROOT / "data" / "prompt_data" / "query.jsonl"
-ARCH_DIR_NAME = "deep_agent_arc"
-ARCH_TYPE = "deep"
-MAX_COMPLETION_ATTEMPTS = int(os.getenv("DEEP_AGENT_MAX_COMPLETION_ATTEMPTS", "3"))
+ARCH_DIR_NAME = "react_agent_arc"
+ARCH_TYPE = "react"
+MAX_COMPLETION_ATTEMPTS = 3
 
 from agent_arcs.citation_integrity import citation_integrity_failure
 from agent_arcs.costs import estimate_run_cost
@@ -31,7 +30,6 @@ from agent_arcs.costs import estimate_run_cost
 def _load_env_file(env_path: Path) -> None:
     if not env_path.exists():
         return
-
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -41,13 +39,13 @@ def _load_env_file(env_path: Path) -> None:
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
-    data: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
             if stripped:
-                data.append(json.loads(stripped))
-    return data
+                rows.append(json.loads(stripped))
+    return rows
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -72,11 +70,9 @@ def _ensure_workspace(q_no: int) -> dict[str, Path]:
         "arch_root": arch_root,
         "report": arch_root / "report",
         "tmp": arch_root / "tmp",
-        "evidence": arch_root / "tmp" / "evidence",
         "drafts": arch_root / "tmp" / "drafts",
         "review": arch_root / "tmp" / "review",
         "run_metrics": arch_root / "run_metrics",
-        "large_tool_results": arch_root / "large_tool_results",
         "race": arch_root / "race",
         "fact": arch_root / "fact",
     }
@@ -98,9 +94,7 @@ def _run_command(command: list[str], *, cwd: Path) -> subprocess.CompletedProces
 
 def _write_process_log(path: Path, command: list[str], result: subprocess.CompletedProcess[str]) -> None:
     path.write_text(
-        "Command: " + " ".join(command) + "\n"
-        f"Return code: {result.returncode}\n\n"
-        + result.stdout,
+        "Command: " + " ".join(command) + "\n" + f"Return code: {result.returncode}\n\n" + result.stdout,
         encoding="utf-8",
     )
 
@@ -135,63 +129,26 @@ def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
     if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
         return f"Coverage review is missing or empty: {coverage_path}"
 
-    self_check_path = paths["review"] / "citation_self_check.md"
-    if not self_check_path.exists():
-        return f"Citation self-check is missing: {self_check_path}"
-    self_check_text = self_check_path.read_text(encoding="utf-8")
-    if not self_check_text.strip():
-        return f"Citation self-check is empty: {self_check_path}"
-    if "NEEDS_REPAIR" not in self_check_text:
-        return None
-    if "## Verdict" in self_check_text:
-        verdict_section = self_check_text.split("## Verdict", 1)[1].split("##", 1)[0]
-        if "NEEDS_REPAIR" in verdict_section:
-            return f"Citation self-check still needs repair: {self_check_path}"
-    first_lines = "\n".join(self_check_text.splitlines()[:30])
-    if "NEEDS_REPAIR" in first_lines:
-        return f"Citation self-check still needs repair: {self_check_path}"
+    audit_path = paths["review"] / "citation_audit.md"
+    if not audit_path.exists() or not audit_path.read_text(encoding="utf-8").strip():
+        return f"Citation audit is missing or empty: {audit_path}"
+
+    audit_text = audit_path.read_text(encoding="utf-8")
+    if "NEEDS_REPAIR" in "\n".join(audit_text.splitlines()[:40]):
+        return f"Citation audit still needs repair: {audit_path}"
     return None
 
 
-def _research_handoff_failure(*, usage: dict[str, Any], article_text: str) -> str | None:
-    artifact_activity = usage.get("artifact_activity", {}) or {}
-    if "research_agent_task_calls" not in artifact_activity:
-        return None
-    if _report_word_count(article_text) < 800:
-        return None
-    research_tasks = int(artifact_activity.get("research_agent_task_calls", 0) or 0)
-    if research_tasks > 0:
-        return None
-    self_checks = int(artifact_activity.get("citation_self_checks", 0) or 0)
-    return (
-        "Deep Agent report was produced without any detected research-agent evidence handoff "
-        f"(research tasks=0, citation self-checks={self_checks}). Use a fresh thread or continue the run "
-        "so research-agent gathers a bounded evidence packet before evaluation."
-    )
-
-
-def _completion_repair_prompt(
-    *,
-    base_prompt: str,
-    report_virtual_path: str,
-    attempt: int,
-) -> str:
+def _completion_repair_prompt(*, base_prompt: str, report_virtual_path: str, attempt: int) -> str:
     return (
         base_prompt
-        + "\n\nThe previous attempt did not produce a complete final report. Continue this same run now. "
-        + f"Read the current report at {report_virtual_path}. If the report file does not exist, create a skeleton/outline first. "
-        + "If it is a skeleton or incomplete, use edit_file section-by-section to replace placeholders and complete sections. Do not rewrite the whole report in one pass. "
-        + "Do not stop after saying you will write. "
-        + "If the report file exists, your next report action must be edit_file, not another announcement. "
-        + "Replace the Executive Summary placeholder first, then continue section-by-section with additional edit_file calls. "
-        + "You must call write_file or edit_file to update the report before any ordinary message claiming writing progress. "
-        + "Do not print the report body in chat; put report content only inside write_file/edit_file tool calls. "
-        + "If prior checkpoint state says research is complete but the usable evidence is missing, rerun only the necessary research. "
-        + "Subagents must return detailed findings directly; do not ask them to write evidence files. "
-        + "Use the iterative cycle: read current draft, incorporate each research-agent handoff into /report/ with write_file/edit_file, update todos, then continue. "
+        + "\n\nThe previous attempt did not produce a complete usable report. Continue this same run now. "
+        + f"Read the current report at {report_virtual_path} if it exists. If it is missing, create a skeleton/outline first. "
+        + "If the report exists or is a skeleton, use edit_file section-by-section to replace placeholders and complete sections; do not rewrite the whole report in one pass. "
+        + "Do not stop after saying you will write. You must call write_file or edit_file to update the report. "
         + "Make the report as complete as the question requires without padding. "
-        + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, and numbered references. "
-        + "Write /tmp/review/coverage_review.md. Write /tmp/review/citation_self_check.md with your citation/reference validation and repair any blocking issues before finalizing. "
+        + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, numbered inline citations, and full URLs. "
+        + "Write /tmp/review/coverage_review.md and /tmp/review/citation_audit.md before finalizing. "
         + f"Completion repair attempt: {attempt}."
     )
 
@@ -225,10 +182,7 @@ def _run_race(
     query_path = paths["race"] / "query.jsonl"
 
     _write_jsonl(query_path, [question])
-    _write_jsonl(
-        raw_data_path,
-        [{"id": q_no, "prompt": question["prompt"], "article": article_text}],
-    )
+    _write_jsonl(raw_data_path, [{"id": q_no, "prompt": question["prompt"], "article": article_text}])
 
     command = [
         sys.executable,
@@ -259,13 +213,7 @@ def _run_race(
     return _parse_key_value_file(paths["race"] / "race_result.txt")
 
 
-def _run_fact(
-    *,
-    q_no: int,
-    question: dict[str, Any],
-    article_text: str,
-    paths: dict[str, Path],
-) -> dict[str, float]:
+def _run_fact(*, q_no: int, question: dict[str, Any], article_text: str, paths: dict[str, Path]) -> dict[str, float]:
     raw_data_path = paths["fact"] / "raw_data.jsonl"
     query_path = paths["fact"] / "query.jsonl"
     extracted_path = paths["fact"] / "extracted.jsonl"
@@ -275,71 +223,14 @@ def _run_fact(
     result_path = paths["fact"] / "fact_result.txt"
 
     _write_jsonl(query_path, [question])
-    _write_jsonl(
-        raw_data_path,
-        [{"id": q_no, "prompt": question["prompt"], "article": article_text}],
-    )
+    _write_jsonl(raw_data_path, [{"id": q_no, "prompt": question["prompt"], "article": article_text}])
 
     commands = [
-        [
-            sys.executable,
-            "-m",
-            "utils.extract",
-            "--output_path",
-            str(extracted_path),
-            "--raw_data_path",
-            str(raw_data_path),
-            "--query_data_path",
-            str(query_path),
-            "--n_total_process",
-            "1",
-        ],
-        [
-            sys.executable,
-            "-m",
-            "utils.deduplicate",
-            "--output_path",
-            str(deduped_path),
-            "--raw_data_path",
-            str(extracted_path),
-            "--query_data_path",
-            str(query_path),
-            "--n_total_process",
-            "1",
-        ],
-        [
-            sys.executable,
-            "-m",
-            "utils.scrape",
-            "--output_path",
-            str(scraped_path),
-            "--raw_data_path",
-            str(deduped_path),
-            "--n_total_process",
-            "4",
-        ],
-        [
-            sys.executable,
-            "-m",
-            "utils.validate",
-            "--output_path",
-            str(validated_path),
-            "--raw_data_path",
-            str(scraped_path),
-            "--query_data_path",
-            str(query_path),
-            "--n_total_process",
-            "4",
-        ],
-        [
-            sys.executable,
-            "-m",
-            "utils.stat",
-            "--input_path",
-            str(validated_path),
-            "--output_path",
-            str(result_path),
-        ],
+        [sys.executable, "-m", "utils.extract", "--output_path", str(extracted_path), "--raw_data_path", str(raw_data_path), "--query_data_path", str(query_path), "--n_total_process", "1"],
+        [sys.executable, "-m", "utils.deduplicate", "--output_path", str(deduped_path), "--raw_data_path", str(extracted_path), "--query_data_path", str(query_path), "--n_total_process", "1"],
+        [sys.executable, "-m", "utils.scrape", "--output_path", str(scraped_path), "--raw_data_path", str(deduped_path), "--n_total_process", "4"],
+        [sys.executable, "-m", "utils.validate", "--output_path", str(validated_path), "--raw_data_path", str(scraped_path), "--query_data_path", str(query_path), "--n_total_process", "4"],
+        [sys.executable, "-m", "utils.stat", "--input_path", str(validated_path), "--output_path", str(result_path)],
     ]
 
     for index, command in enumerate(commands, start=1):
@@ -347,7 +238,6 @@ def _run_fact(
         _write_process_log(paths["fact"] / f"fact_step_{index}.log", command, result)
         if result.returncode != 0:
             raise RuntimeError(f"FACT step {index} failed; see {paths['fact'] / f'fact_step_{index}.log'}")
-
     return _parse_key_value_file(result_path)
 
 
@@ -359,10 +249,9 @@ def _write_benchmark_markdown(q_root: Path) -> None:
     lines = [
         f"# Question {q_root.name.removeprefix('q')} Benchmark",
         "",
-        "| Architecture | Thread ID | RACE Overall | Comprehensiveness | Insight | Instruction Following | Readability | FACT Valid Rate | Total Tokens | Tavily Calls | Est. LLM Cost | Est. Tavily Cost | Est. Total Cost | Research Tasks | Citation Self-Checks | Report Updates | Report |",
+        "| Architecture | Thread ID | RACE Overall | Comprehensiveness | Insight | Instruction Following | Readability | FACT Valid Rate | Total Tokens | Tavily Calls | Est. LLM Cost | Est. Tavily Cost | Est. Total Cost | Research Tasks | Audit Tasks | Report Updates | Report |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-
     for summary in summaries:
         race = summary.get("race", {}) or {}
         fact = summary.get("fact", {}) or {}
@@ -371,18 +260,12 @@ def _write_benchmark_markdown(q_root: Path) -> None:
         llm_cost = (cost.get("llm", {}) or {}).get("total_cost_usd", 0.0)
         tavily_cost = (cost.get("tavily", {}) or {}).get("cost_usd", 0.0)
         total_cost = cost.get("total_cost_usd", 0.0)
-        total_tokens = (
-            usage.get("main_agent_tokens", {}).get("total_tokens", 0)
-            + usage.get("subagents_total_tokens", {}).get("total_tokens", 0)
-        )
-        tavily_calls = usage.get("tavily_tool_calls", {}).get("total", 0)
+        total_tokens = usage.get("main_agent_tokens", {}).get("total_tokens", 0) + usage.get("subagents_total_tokens", {}).get("total_tokens", 0)
         artifact_activity = usage.get("artifact_activity", {}) or {}
         research_tasks = artifact_activity.get("research_agent_task_calls", 0)
-        self_checks = artifact_activity.get("citation_self_checks", 0)
-        report_updates = artifact_activity.get("report_file_updates", 0)
-        report_path = summary.get("report_path") or ""
+        audit_tasks = artifact_activity.get("citation_auditor_task_calls", 0)
         lines.append(
-            "| {arch} | `{thread}` | {overall:.4f} | {comp:.4f} | {insight:.4f} | {inst:.4f} | {read:.4f} | {valid:.4f} | {tokens} | {calls} | ${llm_cost:.4f} | ${tavily_cost:.4f} | ${total_cost:.4f} | {research_tasks} | {self_checks} | {updates} | `{report}` |".format(
+            "| {arch} | `{thread}` | {overall:.4f} | {comp:.4f} | {insight:.4f} | {inst:.4f} | {read:.4f} | {valid:.4f} | {tokens} | {calls} | ${llm_cost:.4f} | ${tavily_cost:.4f} | ${total_cost:.4f} | {research_tasks} | {audit_tasks} | {updates} | `{report}` |".format(
                 arch=summary.get("architecture", ""),
                 thread=summary.get("thread_id", ""),
                 overall=race.get("Overall Score", 0.0),
@@ -392,17 +275,16 @@ def _write_benchmark_markdown(q_root: Path) -> None:
                 read=race.get("Readability", 0.0),
                 valid=fact.get("valid_rate", 0.0),
                 tokens=total_tokens,
-                calls=tavily_calls,
+                calls=usage.get("tavily_tool_calls", {}).get("total", 0),
                 llm_cost=float(llm_cost or 0.0),
                 tavily_cost=float(tavily_cost or 0.0),
                 total_cost=float(total_cost or 0.0),
                 research_tasks=research_tasks,
-                self_checks=self_checks,
-                updates=report_updates,
-                report=report_path,
+                audit_tasks=audit_tasks,
+                updates=artifact_activity.get("report_file_updates", 0),
+                report=summary.get("report_path") or "",
             )
         )
-
     (q_root / f"{q_root.name}_bm.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -461,11 +343,10 @@ async def _run(args: argparse.Namespace) -> None:
         + "\n\nWrite the final polished Markdown report to exactly "
         + report_virtual_path
         + ". Use numbered inline citations and a numbered References section with full URLs."
-        + " Run coverage review and write a citation self-check; if the self-check finds blocking issues, repair them before finalizing."
-        + " For non-trivial sourced research, first perform only a scout: your first todo list must contain exactly one in-progress scout item and no skeleton, research-batch, synthesis, review, citation-check, or finalization items. After the scout handoff returns, write the report skeleton, then create the detailed plan, then launch follow-up research batches."
+        + " Write /tmp/review/coverage_review.md and /tmp/review/citation_audit.md before finalizing."
     )
 
-    os.environ["DEEP_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
+    os.environ["REACT_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
 
     start = time.monotonic()
     if args.skip_agent:
@@ -473,21 +354,19 @@ async def _run(args: argparse.Namespace) -> None:
         if not report_path.exists():
             raise FileNotFoundError(f"Expected existing report at {report_path}")
         article_text = report_path.read_text(encoding="utf-8")
-        from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues
+        from agent_arcs.react_agent_arc.smoke_test import _report_placeholder_issues
 
         placeholder_issues = _report_placeholder_issues(article_text)
         if placeholder_issues:
-            issue_text = "; ".join(placeholder_issues)
-            raise RuntimeError(f"Report at {report_path} is still a skeleton: {issue_text}")
+            raise RuntimeError(f"Report at {report_path} is still a skeleton: {'; '.join(placeholder_issues)}")
         metrics_path = None
         run_id = None
     else:
-        from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues, _stream_run
+        from agent_arcs.react_agent_arc.smoke_test import _report_placeholder_issues, _stream_run
 
         result = None
         article_text = ""
-        completion_attempts = MAX_COMPLETION_ATTEMPTS
-        for attempt in range(1, completion_attempts + 1):
+        for attempt in range(1, MAX_COMPLETION_ATTEMPTS + 1):
             run_prompt = prompt if attempt == 1 else _completion_repair_prompt(
                 base_prompt=prompt,
                 report_virtual_path=report_virtual_path,
@@ -502,7 +381,7 @@ async def _run(args: argparse.Namespace) -> None:
             article_text = result.article_text
             if result.report_path is None:
                 print(
-                    f"report incomplete after attempt {attempt}/{completion_attempts}: "
+                    f"report incomplete after attempt {attempt}/{MAX_COMPLETION_ATTEMPTS}: "
                     f"expected report file was not written at {report_virtual_path}. continuing..."
                 )
                 continue
@@ -510,20 +389,16 @@ async def _run(args: argparse.Namespace) -> None:
             if article_text.strip() and not placeholder_issues:
                 break
             issue_text = "; ".join(placeholder_issues) if placeholder_issues else "empty report"
-            print(
-                f"report incomplete after attempt {attempt}/{completion_attempts}: {issue_text}. "
-                "continuing..."
-            )
+            print(f"report incomplete after attempt {attempt}/{MAX_COMPLETION_ATTEMPTS}: {issue_text}. continuing...")
         if result is None:
             raise RuntimeError("Agent did not run.")
         if result.report_path is None:
             raise RuntimeError(
-                f"Report file was not written after {completion_attempts} attempts: {report_virtual_path}"
+                f"Report file was not written after {MAX_COMPLETION_ATTEMPTS} attempts: {report_virtual_path}"
             )
         placeholder_issues = _report_placeholder_issues(article_text)
         if placeholder_issues:
-            issue_text = "; ".join(placeholder_issues)
-            raise RuntimeError(f"Report is still incomplete after {completion_attempts} attempts: {issue_text}")
+            raise RuntimeError(f"Report is still incomplete after {MAX_COMPLETION_ATTEMPTS} attempts: {'; '.join(placeholder_issues)}")
         report_path = result.report_path
         metrics_path = result.metrics_path
         run_id = result.run_id
@@ -533,40 +408,22 @@ async def _run(args: argparse.Namespace) -> None:
     citation_failure = citation_integrity_failure(article_text)
     if citation_failure and not args.skip_eval:
         print(f"WARNING: citation integrity check found a non-blocking issue: {citation_failure}")
-    usage = _read_run_metrics(metrics_path)
-    research_failure = _research_handoff_failure(usage=usage, article_text=article_text)
-    if research_failure and not args.skip_eval:
-        raise RuntimeError(research_failure)
     review_failure = _review_artifact_failure(paths)
     if review_failure and not args.skip_eval:
-        raise RuntimeError(
-            review_failure
-            + "; use a fresh thread or continue the agent to complete review artifacts before eval."
-        )
+        raise RuntimeError(review_failure + "; continue the agent or use a fresh thread before eval.")
 
     race_metrics: dict[str, float] = {}
     fact_metrics: dict[str, float] = {}
     if not args.skip_eval:
         print("\nRunning RACE evaluation...")
-        race_metrics = _run_race(
-            q_no=args.q_no,
-            question=question,
-            article_text=article_text,
-            paths=paths,
-            force=args.force_eval,
-        )
+        race_metrics = _run_race(q_no=args.q_no, question=question, article_text=article_text, paths=paths, force=args.force_eval)
         print("Running FACT evaluation...")
-        fact_metrics = _run_fact(
-            q_no=args.q_no,
-            question=question,
-            article_text=article_text,
-            paths=paths,
-        )
+        fact_metrics = _run_fact(q_no=args.q_no, question=question, article_text=article_text, paths=paths)
 
+    usage = _read_run_metrics(metrics_path)
     cost_estimate = estimate_run_cost(
         usage=usage,
         main_model=os.getenv("AI_MODEL"),
-        subagent_model=os.getenv("SUB_MODEL"),
     )
     summary = {
         "question_id": args.q_no,
@@ -590,7 +447,6 @@ async def _run(args: argparse.Namespace) -> None:
     summary_path = paths["arch_root"] / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     _write_benchmark_markdown(paths["q_root"])
-
     _print_score_summary(
         q_no=args.q_no,
         report_path=report_path,
@@ -605,7 +461,7 @@ async def _run(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one research question with the configured workflow.")
     parser.add_argument("--q-no", type=int, required=True, help="Question id from deep_research_bench/data/prompt_data/query.jsonl.")
-    parser.add_argument("--thread-id", help="Optional explicit LangGraph thread id.")
+    parser.add_argument("--thread-id", help="Optional checkpoint thread id.")
     parser.add_argument("--skip-agent", action="store_true", help="Reuse an existing report instead of running the agent.")
     parser.add_argument("--skip-eval", action="store_true", help="Skip RACE and FACT evaluation.")
     parser.add_argument("--force-eval", action="store_true", help="Remove prior RACE/FACT outputs before evaluating.")

@@ -76,11 +76,22 @@ def _truncate(text: str, limit: int = 220) -> str:
 def _report_placeholder_issues(article_text: str) -> list[str]:
     lowered = article_text.lower()
     checks = {
-        "contains unfinished-section placeholder": "will be completed after all research",
+        "contains html placeholder comments": "<!-- placeholder",
+        "contains placeholder table cells": "| <!-- placeholder -->",
+        "contains placeholder marker": "placeholder",
+        "contains unfinished-after-research placeholder": "will be completed after all research",
+        "contains unfinished-after-sections placeholder": "will be completed after all sections",
         "contains unfinished-references placeholder": "references will be populated",
         "contains generic placeholder marker": "*this section will be completed",
     }
     return [label for label, needle in checks.items() if needle in lowered]
+
+
+def _report_is_complete(path: Path | None) -> bool:
+    if path is None or not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    return bool(text.strip()) and not _report_placeholder_issues(text)
 
 
 def _format_todos(content: object) -> str:
@@ -118,7 +129,7 @@ def _format_todos(content: object) -> str:
     return "\n".join(lines) if lines else "updated"
 
 
-def _format_tool_args(raw_args: object) -> str:
+def _format_tool_args(raw_args: object, *, agent_name: str = "", tool_name: str = "") -> str:
     if raw_args is None:
         return ""
     if isinstance(raw_args, str):
@@ -131,6 +142,26 @@ def _format_tool_args(raw_args: object) -> str:
     if not isinstance(parsed, dict):
         return _truncate(str(parsed))
 
+    if agent_name == "main-agent" and tool_name == "task":
+        lines: list[str] = []
+        for key in ("subagent_type", "name", "description", "prompt"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"{key}: {value.strip()}")
+        return "\n".join(lines) if lines else json.dumps(parsed, ensure_ascii=True, indent=2)
+    if tool_name == "think_tool" and "reflection" in parsed:
+        return str(parsed["reflection"])
+    if tool_name in {"write_file", "edit_file"}:
+        lines = []
+        file_path = parsed.get("file_path")
+        if isinstance(file_path, str):
+            lines.append(f"file_path: {file_path}")
+        for key in ("old_string", "new_string", "content"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"{key}:\n{value.strip()}")
+        return "\n".join(lines) if lines else json.dumps(parsed, ensure_ascii=True, indent=2)
+
     if "description" in parsed:
         return _truncate(str(parsed["description"]))
     if "reflection" in parsed:
@@ -140,6 +171,22 @@ def _format_tool_args(raw_args: object) -> str:
     if "urls" in parsed:
         return _truncate(json.dumps(parsed, ensure_ascii=True))
     return _truncate(json.dumps(parsed, ensure_ascii=True))
+
+
+def _task_target_name(tool_input: object) -> str | None:
+    if not isinstance(tool_input, dict):
+        return None
+    for key in ("subagent_type", "agent", "name"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    description = tool_input.get("description") or tool_input.get("task") or tool_input.get("prompt")
+    if not isinstance(description, str):
+        return None
+    lowered = description.lower()
+    if "research-agent" in lowered or "research agent" in lowered:
+        return "research-agent"
+    return None
 
 
 def _normalize_agent_name(name: object) -> str:
@@ -174,19 +221,30 @@ def _prompt_with_run_metadata(
     report_path = expected_report_path or "/report/final_report.md"
     metadata = f"""\
 <run_metadata>
-LangGraph thread_id: {thread_id}
-Physical workspace root: {WORKSPACE_ROOT}
-Virtual workspace root for agent tools: /
-Virtual large tool result directory: /large_tool_results/
-Virtual draft directory: /tmp/drafts/
-Virtual review directory: /tmp/review/
+Thread ID: {thread_id}
+Virtual workspace root: /
+Accessible artifact directories:
+- /report/ final report files
+- /tmp/drafts/ intermediate drafts and oversized appendices
+- /tmp/review/ coverage reviews, source registries, citation self-checks, and repair notes
+- /large_tool_results/ automatically offloaded large tool results
+- /conversation_history/ summarized conversation history that can be recovered if exact prior details are needed
 Virtual final report path: {report_path}
 
-Use virtual absolute paths with filesystem tools. Do not use the physical workspace root in
-tool calls. When delegating to subagents, include the thread_id and the expected direct handoff
-format in the task description. Subagents should return findings directly; use /tmp/drafts/ only
-for unusually large supplementary appendices. Use /tmp/review/ for coverage and citation audits. If a tool result is automatically offloaded to
-/large_tool_results/<tool_call_id>, read_file or grep that path before relying on the result.
+Use virtual absolute paths only. Subagents should return findings directly; use /tmp/drafts/ only
+for unusually large supplementary appendices. Use /tmp/review/ for coverage and citation self-checks.
+If a useful result is offloaded to /large_tool_results/ or prior history is summarized to
+/conversation_history/, inspect or search the referenced path before relying on missing details.
+Do not output the full report body in chat. Put report content only in write_file/edit_file calls;
+ordinary assistant messages should be brief status or final-path notes.
+For non-trivial sourced research, your first todo list must contain exactly one in-progress scout
+todo. Do not include skeleton, research batch, synthesis, review, citation, or finalization todos
+until the scout handoff has returned. After scout: write /report/ skeleton, then create the detailed
+plan, then launch the first research batch.
+Use an iterative research-to-writing cycle: process each research-agent batch into report edits
+before launching the next broad batch, then update todos based on the current draft's remaining gaps.
+Parallelism is for independent research-agent calls within a batch. After a batch returns, switch
+to synthesis/editing and update /report/ before launching another broad batch.
 </run_metadata>
 """
     return metadata + "\n" + prompt
@@ -199,6 +257,7 @@ def _save_run_metrics(
     prompt: str,
     token_usage_by_agent: dict[str, dict[str, int]],
     tavily_call_counts: dict[str, int],
+    artifact_activity: dict[str, int | list[str]],
 ) -> Path:
     RUN_METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -227,6 +286,7 @@ def _save_run_metrics(
             "total": sum(tavily_call_counts.values()),
             "by_tool": dict(sorted(tavily_call_counts.items())),
         },
+        "artifact_activity": artifact_activity,
     }
 
     output_path = RUN_METRICS_DIR / f"{run_id}.json"
@@ -257,6 +317,20 @@ async def _stream_run(
         lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
     tavily_call_counts: dict[str, int] = defaultdict(int)
+    artifact_activity: dict[str, int | list[str]] = {
+        "subagent_task_calls": 0,
+        "research_agent_task_calls": 0,
+        "citation_self_checks": 0,
+        "unknown_subagent_task_calls": 0,
+        "report_file_updates": 0,
+        "review_file_updates": 0,
+        "other_file_updates": 0,
+        "max_subagent_tasks_between_report_updates": 0,
+        "max_subagent_tasks_between_report_or_review_updates": 0,
+        "warnings": [],
+    }
+    subagent_tasks_since_report_update = 0
+    subagent_tasks_since_artifact_update = 0
 
     print(_style(f"Thread: {thread_id}", BOLD, CYAN))
     print(_style("Prompt:", BOLD, CYAN), prompt)
@@ -324,18 +398,43 @@ async def _stream_run(
                 key = (tool_name, run_id)
                 if key not in shown_tool_calls:
                     shown_tool_calls.add(key)
-                    arg_preview = _format_tool_args(data.get("input"))
+                    arg_preview = _format_tool_args(data.get("input"), agent_name=agent_name, tool_name=tool_name)
                     print()
                     print(_style(f"[call:{tool_name}]", BOLD, MAGENTA), arg_preview)
                 tool_input = data.get("input")
-                if (
-                    agent_name == "main-agent"
-                    and tool_name == "write_file"
-                    and isinstance(tool_input, dict)
-                ):
+                if agent_name == "main-agent" and tool_name == "task":
+                    artifact_activity["subagent_task_calls"] = int(artifact_activity["subagent_task_calls"]) + 1
+                    target_name = _task_target_name(tool_input)
+                    if target_name == "research-agent":
+                        artifact_activity["research_agent_task_calls"] = int(artifact_activity["research_agent_task_calls"]) + 1
+                    else:
+                        artifact_activity["unknown_subagent_task_calls"] = int(artifact_activity["unknown_subagent_task_calls"]) + 1
+                    subagent_tasks_since_report_update += 1
+                    subagent_tasks_since_artifact_update += 1
+                    artifact_activity["max_subagent_tasks_between_report_updates"] = max(
+                        int(artifact_activity["max_subagent_tasks_between_report_updates"]),
+                        subagent_tasks_since_report_update,
+                    )
+                    artifact_activity["max_subagent_tasks_between_report_or_review_updates"] = max(
+                        int(artifact_activity["max_subagent_tasks_between_report_or_review_updates"]),
+                        subagent_tasks_since_artifact_update,
+                    )
+                if agent_name == "main-agent" and tool_name in {"write_file", "edit_file"} and isinstance(tool_input, dict):
                     file_path = tool_input.get("file_path")
-                    if isinstance(file_path, str) and file_path.startswith("/report/") and file_path.endswith(".md"):
-                        report_file_candidates.append(_resolve_virtual_path(file_path))
+                    if isinstance(file_path, str):
+                        if file_path.startswith("/report/"):
+                            artifact_activity["report_file_updates"] = int(artifact_activity["report_file_updates"]) + 1
+                            subagent_tasks_since_report_update = 0
+                            subagent_tasks_since_artifact_update = 0
+                            if file_path.endswith(".md"):
+                                report_file_candidates.append(_resolve_virtual_path(file_path))
+                        elif file_path.startswith("/tmp/review/"):
+                            artifact_activity["review_file_updates"] = int(artifact_activity["review_file_updates"]) + 1
+                            if file_path.endswith("/citation_self_check.md"):
+                                artifact_activity["citation_self_checks"] = int(artifact_activity["citation_self_checks"]) + 1
+                            subagent_tasks_since_artifact_update = 0
+                        else:
+                            artifact_activity["other_file_updates"] = int(artifact_activity["other_file_updates"]) + 1
                 if tool_name.startswith("tavily_"):
                     tavily_call_counts[tool_name] += 1
                 continue
@@ -357,7 +456,8 @@ async def _stream_run(
                 print(_format_todos(todos))
                 continue
 
-            preview = _truncate(str(data.get("output", "")))
+            output = str(data.get("output", ""))
+            preview = output if tool_name == "think_tool" else _truncate(output)
             if preview:
                 print()
                 print(_style(f"[tool:{tool_name}]", BOLD, BLUE), preview)
@@ -395,6 +495,34 @@ async def _stream_run(
         for tool_name in sorted(tavily_call_counts):
             print(f"  {tool_name}: {tavily_call_counts[tool_name]}")
 
+        warnings = artifact_activity["warnings"]
+        if not isinstance(warnings, list):
+            warnings = []
+            artifact_activity["warnings"] = warnings
+        subagent_task_calls = int(artifact_activity["subagent_task_calls"])
+        research_task_calls = int(artifact_activity["research_agent_task_calls"])
+        citation_self_checks = int(artifact_activity["citation_self_checks"])
+        report_updates = int(artifact_activity["report_file_updates"])
+        max_without_artifact = int(artifact_activity["max_subagent_tasks_between_report_or_review_updates"])
+        if subagent_task_calls >= 2 and report_updates <= 1:
+            warnings.append(
+                "Agent made multiple subagent task calls but updated /report/ once or less; living-report behavior may be weak."
+            )
+        if max_without_artifact > 2:
+            warnings.append(
+                f"Agent made {max_without_artifact} subagent task calls between /report/ or /tmp/review/ updates."
+            )
+        print(
+            "artifact activity: "
+            f"subagent_tasks={subagent_task_calls}, "
+            f"research_tasks={research_task_calls}, "
+            f"citation_self_checks={citation_self_checks}, "
+            f"report_updates={report_updates}, "
+            f"review_updates={artifact_activity['review_file_updates']}"
+        )
+        for warning in warnings:
+            print(_style(f"WARNING: {warning}", BOLD, YELLOW))
+
         metrics_run_id = root_run_id or f"{thread_id}-{int(datetime.now(UTC).timestamp())}"
         metrics_path = _save_run_metrics(
             run_id=metrics_run_id,
@@ -402,6 +530,7 @@ async def _stream_run(
             prompt=agent_prompt,
             token_usage_by_agent=dict(token_usage_by_agent),
             tavily_call_counts=dict(tavily_call_counts),
+            artifact_activity=artifact_activity,
         )
         print(f"metrics saved: {metrics_path}")
         print(_style("Stream complete.", BOLD, CYAN))
@@ -427,10 +556,16 @@ async def _stream_run(
                     if fail_on_incomplete_report:
                         raise RuntimeError(message)
                     print(_style(f"WARNING: {message}", BOLD, YELLOW))
-        for candidate in reversed(completed_model_text.get("main-agent", [])):
-            if not article_text and candidate.strip():
-                article_text = candidate
-                break
+        elif expected_report_path:
+            message = f"Expected report was not written: {expected_report_path}"
+            if fail_on_incomplete_report:
+                raise RuntimeError(message)
+            print(_style(f"WARNING: {message}", BOLD, YELLOW))
+        else:
+            for candidate in reversed(completed_model_text.get("main-agent", [])):
+                if candidate.strip():
+                    article_text = candidate
+                    break
         return StreamRunResult(
             article_text=article_text,
             metrics_path=metrics_path,

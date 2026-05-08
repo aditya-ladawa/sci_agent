@@ -17,7 +17,7 @@ else:
 
 TAVILY_REMOTE_MCP_URL = "https://mcp.tavily.com/mcp"
 DEFAULT_PARAMETERS = {
-    "search_depth": "advanced",
+    "search_depth": "basic",
     "max_results": 10,
 }
 MCP_CONNECT_RETRIES = 3
