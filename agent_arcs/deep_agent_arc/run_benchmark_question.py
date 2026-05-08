@@ -130,6 +130,13 @@ def _report_word_count(article_text: str) -> int:
     return len(article_text.split())
 
 
+def _activity_count(activity: dict[str, Any], key: str) -> int:
+    try:
+        return int(activity.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
     coverage_path = paths["review"] / "coverage_review.md"
     if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
@@ -150,6 +157,35 @@ def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
     first_lines = "\n".join(self_check_text.splitlines()[:30])
     if "NEEDS_REPAIR" in first_lines:
         return f"Citation self-check still needs repair: {self_check_path}"
+    return None
+
+
+def _current_run_artifact_failure(
+    *,
+    paths: dict[str, Path],
+    report_path: Path | None,
+    usage: dict[str, Any],
+    run_started_at: float,
+) -> str | None:
+    artifact_activity = usage.get("artifact_activity", {}) or {}
+    if not artifact_activity:
+        return "Run metrics are missing artifact activity, so current-run report ownership cannot be verified."
+
+    report_updates = _activity_count(artifact_activity, "report_file_updates")
+    if report_updates == 0:
+        return "Current Deep run did not write or edit /report/; refusing to evaluate a possibly stale report."
+
+    artifact_paths = [path for path in [report_path] if path is not None]
+    artifact_paths.extend(
+        [
+            paths["review"] / "coverage_review.md",
+            paths["review"] / "citation_self_check.md",
+        ]
+    )
+    stale_paths = [path for path in artifact_paths if path.exists() and path.stat().st_mtime < run_started_at]
+    if stale_paths:
+        formatted_paths = ", ".join(str(path) for path in stale_paths)
+        return f"Current run appears to rely on stale artifact files from before this run: {formatted_paths}"
     return None
 
 
@@ -466,7 +502,7 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     os.environ["DEEP_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
-
+    run_started_at = time.time()
     start = time.monotonic()
     if args.skip_agent:
         report_path = paths["arch_root"] / report_virtual_path.removeprefix("/")
@@ -534,6 +570,18 @@ async def _run(args: argparse.Namespace) -> None:
     if citation_failure and not args.skip_eval:
         print(f"WARNING: citation integrity check found a non-blocking issue: {citation_failure}")
     usage = _read_run_metrics(metrics_path)
+    if not args.skip_agent:
+        current_run_failure = _current_run_artifact_failure(
+            paths=paths,
+            report_path=report_path,
+            usage=usage,
+            run_started_at=run_started_at,
+        )
+        if current_run_failure:
+            if args.skip_eval:
+                print(f"WARNING: {current_run_failure}")
+            else:
+                raise RuntimeError(current_run_failure)
     research_failure = _research_handoff_failure(usage=usage, article_text=article_text)
     if research_failure and not args.skip_eval:
         raise RuntimeError(research_failure)

@@ -124,6 +124,13 @@ def _report_word_count(article_text: str) -> int:
     return len(article_text.split())
 
 
+def _activity_count(activity: dict[str, Any], key: str) -> int:
+    try:
+        return int(activity.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
     coverage_path = paths["review"] / "coverage_review.md"
     if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
@@ -134,8 +141,53 @@ def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
         return f"Citation audit is missing or empty: {audit_path}"
 
     audit_text = audit_path.read_text(encoding="utf-8")
-    if "NEEDS_REPAIR" in "\n".join(audit_text.splitlines()[:40]):
+    if "NEEDS_REPAIR" in audit_text:
         return f"Citation audit still needs repair: {audit_path}"
+    audit_lines = audit_text.splitlines()
+    for index, line in enumerate(audit_lines):
+        normalized_heading = line.strip().lower().strip("# ").rstrip(":")
+        if normalized_heading != "action items":
+            continue
+        section_lines: list[str] = []
+        for section_line in audit_lines[index + 1 :]:
+            if section_line.startswith("#"):
+                break
+            section_lines.append(section_line.strip())
+        section_text = "\n".join(section_lines).strip().lower()
+        if section_text and not any(
+            phrase in section_text
+            for phrase in ("none", "no action", "no unresolved", "not applicable", "not required", "n/a")
+        ):
+            return f"Citation audit has unresolved action items: {audit_path}"
+    return None
+
+
+def _current_run_artifact_failure(
+    *,
+    paths: dict[str, Path],
+    report_path: Path | None,
+    usage: dict[str, Any],
+    run_started_at: float,
+) -> str | None:
+    artifact_activity = usage.get("artifact_activity", {}) or {}
+    if not artifact_activity:
+        return "Run metrics are missing artifact activity, so current-run report ownership cannot be verified."
+
+    report_updates = _activity_count(artifact_activity, "report_file_updates")
+    if report_updates == 0:
+        return "Current ReAct run did not write or edit /report/; refusing to evaluate a possibly stale report."
+
+    artifact_paths = [path for path in [report_path] if path is not None]
+    artifact_paths.extend(
+        [
+            paths["review"] / "coverage_review.md",
+            paths["review"] / "citation_audit.md",
+        ]
+    )
+    stale_paths = [path for path in artifact_paths if path.exists() and path.stat().st_mtime < run_started_at]
+    if stale_paths:
+        formatted_paths = ", ".join(str(path) for path in stale_paths)
+        return f"Current run appears to rely on stale artifact files from before this run: {formatted_paths}"
     return None
 
 
@@ -145,7 +197,8 @@ def _completion_repair_prompt(*, base_prompt: str, report_virtual_path: str, att
         + "\n\nThe previous attempt did not produce a complete usable report. Continue this same run now. "
         + f"Read the current report at {report_virtual_path} if it exists. If it is missing, create a skeleton/outline first. "
         + "If the report exists or is a skeleton, use edit_file section-by-section to replace placeholders and complete sections; do not rewrite the whole report in one pass. "
-        + "Do not stop after saying you will write. You must call write_file or edit_file to update the report. "
+        + "Treat artifact updates as the evidence of writing progress. Your next drafting or revision step should update the report artifact. "
+        + "After each additional targeted research batch, update /report/... or /tmp/review/... before doing more broad research unless the batch produced no useful evidence. "
         + "Make the report as complete as the question requires without padding. "
         + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, numbered inline citations, and full URLs. "
         + "Write /tmp/review/coverage_review.md and /tmp/review/citation_audit.md before finalizing. "
@@ -347,7 +400,7 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     os.environ["REACT_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
-
+    run_started_at = time.time()
     start = time.monotonic()
     if args.skip_agent:
         report_path = paths["arch_root"] / report_virtual_path.removeprefix("/")
@@ -405,6 +458,19 @@ async def _run(args: argparse.Namespace) -> None:
 
     if not article_text.strip():
         raise RuntimeError("Agent did not produce article text for evaluation.")
+    usage = _read_run_metrics(metrics_path)
+    if not args.skip_agent:
+        current_run_failure = _current_run_artifact_failure(
+            paths=paths,
+            report_path=report_path,
+            usage=usage,
+            run_started_at=run_started_at,
+        )
+        if current_run_failure:
+            if args.skip_eval:
+                print(f"WARNING: {current_run_failure}")
+            else:
+                raise RuntimeError(current_run_failure)
     citation_failure = citation_integrity_failure(article_text)
     if citation_failure and not args.skip_eval:
         print(f"WARNING: citation integrity check found a non-blocking issue: {citation_failure}")
@@ -420,7 +486,6 @@ async def _run(args: argparse.Namespace) -> None:
         print("Running FACT evaluation...")
         fact_metrics = _run_fact(q_no=args.q_no, question=question, article_text=article_text, paths=paths)
 
-    usage = _read_run_metrics(metrics_path)
     cost_estimate = estimate_run_cost(
         usage=usage,
         main_model=os.getenv("AI_MODEL"),
