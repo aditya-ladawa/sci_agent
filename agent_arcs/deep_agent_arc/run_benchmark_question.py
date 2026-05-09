@@ -23,7 +23,7 @@ BENCH_CODE_ROOT = PROJECT_ROOT / "deep_research_bench"
 QUERY_FILE = BENCH_CODE_ROOT / "data" / "prompt_data" / "query.jsonl"
 ARCH_DIR_NAME = "deep_agent_arc"
 ARCH_TYPE = "deep"
-MAX_COMPLETION_ATTEMPTS = int(os.getenv("DEEP_AGENT_MAX_COMPLETION_ATTEMPTS", "3"))
+MAX_COMPLETION_ATTEMPTS = int(os.getenv("DEEP_AGENT_MAX_COMPLETION_ATTEMPTS", "6"))
 
 from agent_arcs.citation_integrity import citation_integrity_failure
 from agent_arcs.costs import estimate_run_cost
@@ -306,10 +306,13 @@ def _completion_repair_prompt(
     base_prompt: str,
     report_virtual_path: str,
     attempt: int,
+    issues: list[str],
 ) -> str:
+    issue_text = "; ".join(issues) if issues else "the report or review artifacts are incomplete"
     return (
         base_prompt
         + "\n\nThe previous attempt did not produce a complete final report. Continue this same run now. "
+        + f"Blocking issues to fix before evaluation: {issue_text}. "
         + f"Read the current report at {report_virtual_path}. If the report file does not exist, create a skeleton/outline first. "
         + "Never write the complete report in one filesystem call. The first report write_file may only create a skeleton/outline; if the report is a skeleton or incomplete, use edit_file section-by-section to replace placeholders and complete sections. Section-by-section means coherent section, subsection, table, or contiguous placeholder edits, not dozens of citation-only edits. Do not rewrite the whole report in one pass. "
         + "Do not stop after saying you will write. "
@@ -321,10 +324,27 @@ def _completion_repair_prompt(
         + "Subagents must return detailed findings directly; do not ask them to write evidence files. "
         + "Use the iterative cycle: read current draft, incorporate each research-agent handoff into /report/ with edit_file section-by-section after the skeleton exists, update todos, then continue. Never use edit_file to globally replace a bare citation marker such as [10]; anchor citation repairs to the surrounding sentence, table row, or reference entry. "
         + "Make the report as complete as the question requires without padding. "
-        + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, and numbered references. "
-        + "Write /tmp/review/coverage_review.md. Write /tmp/review/citation_self_check.md with your citation/reference validation and repair any blocking issues before finalizing. "
+        + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, and numbered inline citations. If the report has inline citations such as [1], it must also have a final section exactly named ## References with matching uniquely numbered entries, source titles/names, and full http(s) URLs. "
+        + "If /tmp/review/coverage_review.md or /tmp/review/citation_self_check.md is missing or empty, write it now before doing anything else. Write /tmp/review/citation_self_check.md with your citation/reference validation and repair any blocking issues before finalizing. "
+        + "Do not stop after only stating that checks were done; persist the review files with write_file/edit_file. "
         + f"Completion repair attempt: {attempt}."
     )
+
+
+def _completion_blocking_issues(*, article_text: str, paths: dict[str, Path]) -> list[str]:
+    from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues
+
+    issues: list[str] = []
+    if not article_text.strip():
+        issues.append("empty report")
+    issues.extend(_report_placeholder_issues(article_text))
+    citation_failure = citation_integrity_failure(article_text)
+    if citation_failure:
+        issues.append(citation_failure)
+    review_failure = _review_artifact_failure(paths)
+    if review_failure:
+        issues.append(review_failure)
+    return issues
 
 
 def _clean_eval_outputs(paths: dict[str, Path]) -> None:
@@ -637,7 +657,8 @@ async def _run(args: argparse.Namespace) -> None:
         question["prompt"].strip()
         + "\n\nProduce the final polished Markdown report at exactly "
         + report_virtual_path
-        + ". Use numbered inline citations and a numbered References section with full URLs."
+        + ". Use inline numeric citations like [1] and [1][3]. The final major section must be exactly ## References, must be present whenever inline citations appear, and must contain one uniquely numbered entry for every cited number with a title/source name and full http(s) URL."
+        + " Every substantive factual paragraph, factual table row, quantitative value, date, source-position claim, and non-obvious interpretation needs nearby citation support attached to the exact sentence or clause it supports."
         + " Run coverage review and write a citation self-check; if the self-check finds blocking issues, repair them before finalizing."
         + " The runtime has prepared a clean virtual workspace for these expected artifacts: "
         + report_virtual_path
@@ -679,16 +700,18 @@ async def _run(args: argparse.Namespace) -> None:
         run_id = None
     else:
         _clean_current_run_artifacts(paths=paths, report_virtual_path=report_virtual_path)
-        from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues, _stream_run
+        from agent_arcs.deep_agent_arc.smoke_test import _stream_run
 
         result = None
         article_text = ""
         completion_attempts = MAX_COMPLETION_ATTEMPTS
+        blocking_issues: list[str] = []
         for attempt in range(1, completion_attempts + 1):
             run_prompt = prompt if attempt == 1 else _completion_repair_prompt(
                 base_prompt=prompt,
                 report_virtual_path=report_virtual_path,
                 attempt=attempt,
+                issues=blocking_issues,
             )
             try:
                 result = await _stream_run(
@@ -707,10 +730,10 @@ async def _run(args: argparse.Namespace) -> None:
                     f"expected report file was not written at {report_virtual_path}. continuing..."
                 )
                 continue
-            placeholder_issues = _report_placeholder_issues(article_text)
-            if article_text.strip() and not placeholder_issues:
+            blocking_issues = _completion_blocking_issues(article_text=article_text, paths=paths)
+            if not blocking_issues:
                 break
-            issue_text = "; ".join(placeholder_issues) if placeholder_issues else "empty report"
+            issue_text = "; ".join(blocking_issues)
             print(
                 f"report incomplete after attempt {attempt}/{completion_attempts}: {issue_text}. "
                 "continuing..."
@@ -721,9 +744,9 @@ async def _run(args: argparse.Namespace) -> None:
             raise RuntimeError(
                 f"Report file was not written after {completion_attempts} attempts: {report_virtual_path}"
             )
-        placeholder_issues = _report_placeholder_issues(article_text)
-        if placeholder_issues:
-            issue_text = "; ".join(placeholder_issues)
+        blocking_issues = _completion_blocking_issues(article_text=article_text, paths=paths)
+        if blocking_issues:
+            issue_text = "; ".join(blocking_issues)
             raise RuntimeError(f"Report is still incomplete after {completion_attempts} attempts: {issue_text}")
         report_path = result.report_path
         metrics_path = result.metrics_path

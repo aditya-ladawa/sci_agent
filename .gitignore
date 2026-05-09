@@ -15,3 +15,14 @@ wheels/
 client_secret_1048293831853-9mrhsufeb2modfltb0hokjklv29r7pju.apps.googleusercontent.com.json
 
 reprop.txt
+
+# Local runtime and benchmark artifacts
+.langgraph_api/
+.playwright-mcp/
+.tools/
+dr_bench/
+LANGFUSE_BENCHMARK_COMMANDS.txt
+LANGFUSE.md
+
+# Local papers / generated documents
+papers/*.pdf

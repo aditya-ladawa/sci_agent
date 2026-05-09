@@ -8,12 +8,169 @@ from typing import Any
 
 
 DEFAULT_LANGFUSE_BASE_URL = "http://localhost:3000"
+DEFAULT_LANGFUSE_MAX_FIELD_CHARS = 4_000
+DEFAULT_LANGFUSE_MAX_COLLECTION_ITEMS = 20
+
+
+def _max_field_chars() -> int:
+    try:
+        return int(os.getenv("LANGFUSE_MAX_FIELD_CHARS", str(DEFAULT_LANGFUSE_MAX_FIELD_CHARS)))
+    except ValueError:
+        return DEFAULT_LANGFUSE_MAX_FIELD_CHARS
+
+
+def _max_collection_items() -> int:
+    try:
+        return int(os.getenv("LANGFUSE_MAX_COLLECTION_ITEMS", str(DEFAULT_LANGFUSE_MAX_COLLECTION_ITEMS)))
+    except ValueError:
+        return DEFAULT_LANGFUSE_MAX_COLLECTION_ITEMS
 
 
 def _truthy(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _truncate_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    omitted = len(value) - max_chars
+    return value[:max_chars] + f"\n\n[Langfuse payload truncated: omitted {omitted} chars]"
+
+
+def _sanitize_langfuse_payload(value: Any, *, max_chars: int, max_items: int, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[Langfuse payload truncated: max depth reached]"
+    if isinstance(value, str):
+        return _truncate_text(value, max_chars=max_chars)
+    if isinstance(value, bytes):
+        return f"[Langfuse payload omitted: {len(value)} bytes]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        truncated: dict[Any, Any] = {
+            key: _sanitize_langfuse_payload(item_value, max_chars=max_chars, max_items=max_items, depth=depth + 1)
+            for key, item_value in items[:max_items]
+        }
+        if len(items) > max_items:
+            truncated["__langfuse_truncated_items__"] = len(items) - max_items
+        return truncated
+    if isinstance(value, (list, tuple)):
+        sanitized = [
+            _sanitize_langfuse_payload(item, max_chars=max_chars, max_items=max_items, depth=depth + 1)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            sanitized.append(f"[Langfuse payload truncated: omitted {len(value) - max_items} items]")
+        return tuple(sanitized) if isinstance(value, tuple) else sanitized
+    if hasattr(value, "model_copy"):
+        update: dict[str, Any] = {}
+        for attr in ("content", "text", "message", "generations", "llm_output"):
+            if hasattr(value, attr):
+                update[attr] = _sanitize_langfuse_payload(
+                    getattr(value, attr),
+                    max_chars=max_chars,
+                    max_items=max_items,
+                    depth=depth + 1,
+                )
+        if hasattr(value, "artifact"):
+            artifact = getattr(value, "artifact")
+            artifact_text = str(artifact)
+            update["artifact"] = (
+                artifact
+                if len(artifact_text) <= max_chars
+                else f"[Langfuse tool artifact omitted: {len(artifact_text)} chars]"
+            )
+        try:
+            return value.model_copy(update=update) if update else value
+        except Exception:
+            return _truncate_text(str(value), max_chars=max_chars)
+    return value
+
+
+class SanitizingLangfuseCallbackHandler:
+    """Forward LangChain callbacks to Langfuse after trimming oversized payloads."""
+
+    def __init__(self, handler: Any, *, max_chars: int, max_items: int) -> None:
+        self._handler = handler
+        self._max_chars = max_chars
+        self._max_items = max_items
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handler, name)
+
+    def _sanitize_args(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        return (
+            tuple(
+                _sanitize_langfuse_payload(arg, max_chars=self._max_chars, max_items=self._max_items)
+                for arg in args
+            ),
+            {
+                key: _sanitize_langfuse_payload(value, max_chars=self._max_chars, max_items=self._max_items)
+                for key, value in kwargs.items()
+            },
+        )
+
+    def _forward(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        sanitized_args, sanitized_kwargs = self._sanitize_args(args, kwargs)
+        return getattr(self._handler, method_name)(*sanitized_args, **sanitized_kwargs)
+
+    def on_agent_action(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_agent_action", *args, **kwargs)
+
+    def on_agent_finish(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_agent_finish", *args, **kwargs)
+
+    def on_chain_end(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_chain_end", *args, **kwargs)
+
+    def on_chain_error(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_chain_error", *args, **kwargs)
+
+    def on_chain_start(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_chain_start", *args, **kwargs)
+
+    def on_chat_model_start(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_chat_model_start", *args, **kwargs)
+
+    def on_custom_event(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_custom_event", *args, **kwargs)
+
+    def on_llm_end(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_llm_end", *args, **kwargs)
+
+    def on_llm_error(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_llm_error", *args, **kwargs)
+
+    def on_llm_new_token(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_llm_new_token", *args, **kwargs)
+
+    def on_llm_start(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_llm_start", *args, **kwargs)
+
+    def on_retriever_end(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_retriever_end", *args, **kwargs)
+
+    def on_retriever_error(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_retriever_error", *args, **kwargs)
+
+    def on_retriever_start(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_retriever_start", *args, **kwargs)
+
+    def on_retry(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_retry", *args, **kwargs)
+
+    def on_text(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_text", *args, **kwargs)
+
+    def on_tool_end(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_tool_end", *args, **kwargs)
+
+    def on_tool_error(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_tool_error", *args, **kwargs)
+
+    def on_tool_start(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward("on_tool_start", *args, **kwargs)
 
 
 @dataclass(slots=True)
@@ -197,7 +354,12 @@ def configure_langfuse(
         raise RuntimeError("Langfuse tracing requested but package is missing. Install with `uv pip install langfuse`.") from exc
 
     client = get_client()
-    handler = CallbackHandler()
+    raw_handler = CallbackHandler()
+    handler = SanitizingLangfuseCallbackHandler(
+        raw_handler,
+        max_chars=_max_field_chars(),
+        max_items=_max_collection_items(),
+    )
 
     return LangfuseTraceConfig(
         enabled=True,
