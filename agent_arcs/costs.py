@@ -8,8 +8,7 @@ MODEL_PRICING_USD_PER_M_TOKENS = {
     "xiaomi/mimo-v2.5-pro": {"input": 1.0, "output": 3.0},
     "xiaomi/mimo-v2-flash": {"input": 0.09, "output": 0.29},
 }
-DEFAULT_TAVILY_COST_USD_PER_CREDIT = 0.008
-DEFAULT_TAVILY_CREDITS_PER_TOOL_CALL = 1.0
+DEFAULT_DDGS_QUERY_COST_USD = 0.0
 
 
 def _int_metric(metrics: dict[str, Any], key: str) -> int:
@@ -28,6 +27,10 @@ def _float_env(name: str, default: float) -> float:
 
 def _round_cost(value: float) -> float:
     return round(value, 6)
+
+
+def _cost_from_tokens(tokens: int, price_per_million: float) -> float:
+    return tokens * price_per_million / TOKENS_PER_MILLION
 
 
 def _model_pricing(model_name: str | None) -> dict[str, float] | None:
@@ -54,18 +57,21 @@ def _estimate_llm_cost(tokens: dict[str, Any], model_name: str | None) -> dict[s
             "pricing_found": False,
         }
 
-    input_cost = input_tokens / TOKENS_PER_MILLION * pricing["input"]
-    output_cost = output_tokens / TOKENS_PER_MILLION * pricing["output"]
+    input_cost = _cost_from_tokens(input_tokens, pricing["input"])
+    output_cost = _cost_from_tokens(output_tokens, pricing["output"])
+    total_cost = input_cost + output_cost
     return {
         "model": model_name,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "formula": "input_tokens * input_price_per_million / 1e6 + output_tokens * output_price_per_million / 1e6",
         "input_cost_per_million_tokens_usd": pricing["input"],
         "output_cost_per_million_tokens_usd": pricing["output"],
         "input_cost_usd": _round_cost(input_cost),
         "output_cost_usd": _round_cost(output_cost),
-        "cost_usd": _round_cost(input_cost + output_cost),
+        "cost_usd": _round_cost(total_cost),
+        "unrounded_cost_usd": total_cost,
         "pricing_found": True,
     }
 
@@ -84,14 +90,31 @@ def estimate_run_cost(
         subagent_cost["model"] = subagent_model or main_model or "none"
         subagent_cost["pricing_found"] = True
 
-    tavily_calls = _int_metric(usage.get("tavily_tool_calls", {}) or {}, "total")
-    tavily_credits_per_call = _float_env("TAVILY_CREDITS_PER_TOOL_CALL", DEFAULT_TAVILY_CREDITS_PER_TOOL_CALL)
-    tavily_cost_per_credit = _float_env("TAVILY_COST_USD_PER_CREDIT", DEFAULT_TAVILY_COST_USD_PER_CREDIT)
-    tavily_estimated_credits = tavily_calls * tavily_credits_per_call
-    tavily_cost = tavily_estimated_credits * tavily_cost_per_credit
+    ddgs_tool_calls = usage.get("ddgs_tool_calls", {}) or {}
+    ddgs_calls = _int_metric(ddgs_tool_calls, "total")
+    ddgs_query_cost = _float_env("DDGS_QUERY_COST_USD", DEFAULT_DDGS_QUERY_COST_USD)
+    ddgs_cost = ddgs_calls * ddgs_query_cost
 
-    llm_cost = main_cost["cost_usd"] + subagent_cost["cost_usd"]
-    total_cost = llm_cost + tavily_cost
+    main_input_cost = _cost_from_tokens(
+        _int_metric(usage.get("main_agent_tokens", {}) or {}, "input_tokens"),
+        float(main_cost.get("input_cost_per_million_tokens_usd", 0.0) or 0.0),
+    )
+    main_output_cost = _cost_from_tokens(
+        _int_metric(usage.get("main_agent_tokens", {}) or {}, "output_tokens"),
+        float(main_cost.get("output_cost_per_million_tokens_usd", 0.0) or 0.0),
+    )
+    subagent_input_cost = _cost_from_tokens(
+        _int_metric(subagent_tokens, "input_tokens"),
+        float(subagent_cost.get("input_cost_per_million_tokens_usd", 0.0) or 0.0),
+    )
+    subagent_output_cost = _cost_from_tokens(
+        _int_metric(subagent_tokens, "output_tokens"),
+        float(subagent_cost.get("output_cost_per_million_tokens_usd", 0.0) or 0.0),
+    )
+    llm_input_cost = main_input_cost + subagent_input_cost
+    llm_output_cost = main_output_cost + subagent_output_cost
+    llm_cost = llm_input_cost + llm_output_cost
+    total_cost = llm_cost + ddgs_cost
     warnings: list[str] = []
     if not main_cost.get("pricing_found") and main_cost["total_tokens"]:
         warnings.append(f"No LLM pricing configured for main model: {main_model}")
@@ -103,15 +126,21 @@ def estimate_run_cost(
         "llm": {
             "main_agent": main_cost,
             "subagents": subagent_cost,
+            "total_input_tokens": _int_metric(usage.get("main_agent_tokens", {}) or {}, "input_tokens")
+            + _int_metric(subagent_tokens, "input_tokens"),
+            "total_output_tokens": _int_metric(usage.get("main_agent_tokens", {}) or {}, "output_tokens")
+            + _int_metric(subagent_tokens, "output_tokens"),
+            "total_tokens": _int_metric(usage.get("main_agent_tokens", {}) or {}, "total_tokens")
+            + _int_metric(subagent_tokens, "total_tokens"),
+            "input_cost_usd": _round_cost(llm_input_cost),
+            "output_cost_usd": _round_cost(llm_output_cost),
             "total_cost_usd": _round_cost(llm_cost),
         },
-        "tavily": {
-            "tool_calls": tavily_calls,
-            "estimated_credits": _round_cost(tavily_estimated_credits),
-            "credits_per_tool_call_assumption": tavily_credits_per_call,
-            "cost_per_credit_usd": tavily_cost_per_credit,
-            "cost_usd": _round_cost(tavily_cost),
-            "note": "Estimated from local Tavily tool-call counts; dashboard billing may differ if tools consume different credits.",
+        "ddgs": {
+            "tool_calls": ddgs_calls,
+            "query_cost_usd": ddgs_query_cost,
+            "cost_usd": _round_cost(ddgs_cost),
+            "note": "Estimated from local DDGS MCP tool-call counts. DDGS is local/open-source by default, so the default per-call cost is $0. Override with DDGS_QUERY_COST_USD if needed.",
         },
         "total_cost_usd": _round_cost(total_cost),
         "warnings": warnings,

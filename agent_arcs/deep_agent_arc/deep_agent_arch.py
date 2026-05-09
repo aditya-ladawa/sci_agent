@@ -10,15 +10,23 @@ from deepagents.backends import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
-from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRetryMiddleware, TodoListMiddleware, ToolRetryMiddleware
+from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_openai import ChatOpenAI
 
-from agent_arcs.deep_agent_arc.deep_agent_prompts import MAIN_AGENT_SYSTEM_PROMPT, RESEARCH_SUBAGENT_SYSTEM_PROMPT
-from agent_arcs.mcp_and_tools import tavily_mcp_tools
+from agent_arcs.diagnostic_metrics import (
+    DiagnosticDeepSummarizationMiddleware,
+    DiagnosticModelRetryMiddleware,
+    DiagnosticToolRetryMiddleware,
+)
+from agent_arcs.deep_agent_arc.deep_agent_prompts import (
+    MAIN_AGENT_SYSTEM_PROMPT,
+    RESEARCH_SUBAGENT_SYSTEM_PROMPT,
+    SCOUT_SUBAGENT_SYSTEM_PROMPT,
+)
+from agent_arcs.mcp_and_tools import ddgs_mcp_tools
 
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
@@ -35,6 +43,7 @@ WORKSPACE_ROOT = Path(os.getenv("DEEP_AGENT_WORKSPACE_ROOT", str(DEFAULT_WORKSPA
 RUN_ROOT = WORKSPACE_ROOT.parent if WORKSPACE_ROOT.name.endswith("_workspace") else WORKSPACE_ROOT
 REPORTS_DIR = WORKSPACE_ROOT / "report"
 LARGE_TOOL_RESULTS_DIR = WORKSPACE_ROOT / "large_tool_results"
+CONVERSATION_HISTORY_DIR = WORKSPACE_ROOT / "conversation_history"
 TMP_DIR = WORKSPACE_ROOT / "tmp"
 EVIDENCE_DIR = TMP_DIR / "evidence"
 DRAFTS_DIR = TMP_DIR / "drafts"
@@ -109,13 +118,20 @@ def _build_filesystem_backend() -> FilesystemBackend:
     return FilesystemBackend(root_dir=str(WORKSPACE_ROOT), virtual_mode=True)
 
 
-def _build_main_middleware(*, backend: FilesystemBackend, summary_model: ChatOpenAI, research_subagent: dict[str, Any]) -> list[Any]:
+def _build_main_middleware(
+    *,
+    backend: FilesystemBackend,
+    summary_model: ChatOpenAI,
+    scout_subagent: dict[str, Any],
+    research_subagent: dict[str, Any],
+) -> list[Any]:
     return [
         TodoListMiddleware(),
         FilesystemMiddleware(backend=backend),
-        SubAgentMiddleware(backend=backend, subagents=[research_subagent]),
-        SummarizationMiddleware(
+        SubAgentMiddleware(backend=backend, subagents=[scout_subagent, research_subagent]),
+        DiagnosticDeepSummarizationMiddleware(
             model=summary_model,
+            diagnostic_label="main-agent",
             backend=backend,
             trigger=("tokens", MAIN_SUMMARIZATION_TRIGGER_TOKENS),
             keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
@@ -128,16 +144,17 @@ def _build_main_middleware(*, backend: FilesystemBackend, summary_model: ChatOpe
             },
         ),
         PatchToolCallsMiddleware(),
-        ToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0, on_failure=_format_tool_failure),
-        ModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
+        DiagnosticToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0, on_failure=_format_tool_failure),
+        DiagnosticModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
     ]
 
 
-def _build_subagent_middleware(*, backend: FilesystemBackend, summary_model: ChatOpenAI) -> list[Any]:
+def _build_subagent_middleware(*, backend: FilesystemBackend, summary_model: ChatOpenAI, diagnostic_label: str) -> list[Any]:
     return [
         FilesystemMiddleware(backend=backend),
-        SummarizationMiddleware(
+        DiagnosticDeepSummarizationMiddleware(
             model=summary_model,
+            diagnostic_label=diagnostic_label,
             backend=backend,
             trigger=("tokens", SUBAGENT_SUMMARIZATION_TRIGGER_TOKENS),
             keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
@@ -150,19 +167,30 @@ def _build_subagent_middleware(*, backend: FilesystemBackend, summary_model: Cha
             },
         ),
         PatchToolCallsMiddleware(),
-        ToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0, on_failure=_format_tool_failure),
-        ModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
+        DiagnosticToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0, on_failure=_format_tool_failure),
+        DiagnosticModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
     ]
 
 
 def _build_research_subagent(*, backend: FilesystemBackend, internet_tools: Sequence[Any], model: ChatOpenAI) -> dict[str, Any]:
     return {
         "name": "research-agent",
-        "description": "Researches bounded evidence questions using Tavily Internet Search MCP tools and returns section-ready handoffs.",
+        "description": "Researches bounded evidence questions using DDGS MCP tools and returns section-ready handoffs.",
         "system_prompt": RESEARCH_SUBAGENT_SYSTEM_PROMPT,
         "model": model,
         "tools": [think_tool, *internet_tools],
-        "middleware": _build_subagent_middleware(backend=backend, summary_model=model),
+        "middleware": _build_subagent_middleware(backend=backend, summary_model=model, diagnostic_label="research-agent"),
+    }
+
+
+def _build_scout_subagent(*, backend: FilesystemBackend, internet_tools: Sequence[Any], model: ChatOpenAI) -> dict[str, Any]:
+    return {
+        "name": "scout-agent",
+        "description": "Runs tightly bounded landscape scouts using DDGS MCP tools and returns decomposition guidance.",
+        "system_prompt": SCOUT_SUBAGENT_SYSTEM_PROMPT,
+        "model": model,
+        "tools": [think_tool, *internet_tools],
+        "middleware": _build_subagent_middleware(backend=backend, summary_model=model, diagnostic_label="scout-agent"),
     }
 
 
@@ -175,6 +203,7 @@ async def build_deep_research_agent() -> AsyncIterator[Any]:
     CHECKPOINTER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     LARGE_TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    CONVERSATION_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -182,7 +211,8 @@ async def build_deep_research_agent() -> AsyncIterator[Any]:
 
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINTER_DB_PATH)) as checkpointer:
         await checkpointer.setup()
-        async with tavily_mcp_tools() as internet_tools:
+        async with ddgs_mcp_tools() as internet_tools:
+            scout_subagent = _build_scout_subagent(backend=backend, internet_tools=internet_tools, model=sub_model)
             research_subagent = _build_research_subagent(backend=backend, internet_tools=internet_tools, model=sub_model)
             agent = create_agent(
                 model=main_model,
@@ -191,6 +221,7 @@ async def build_deep_research_agent() -> AsyncIterator[Any]:
                 middleware=_build_main_middleware(
                     backend=backend,
                     summary_model=main_model,
+                    scout_subagent=scout_subagent,
                     research_subagent=research_subagent,
                 ),
                 checkpointer=checkpointer,
@@ -202,6 +233,7 @@ async def build_deep_research_agent() -> AsyncIterator[Any]:
 __all__ = [
     "AI_MODEL_TEMPERATURE",
     "CHECKPOINTER_DB_PATH",
+    "CONVERSATION_HISTORY_DIR",
     "DEFAULT_WORKSPACE_ROOT",
     "DR_BENCH_ROOT",
     "DRAFTS_DIR",

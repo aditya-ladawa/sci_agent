@@ -9,6 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from langchain_core.messages import AIMessageChunk
 
@@ -17,6 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent_arcs.react_agent_arc.react_agent_arch import WORKSPACE_ROOT, build_react_research_agent
+from agent_arcs.diagnostic_metrics import (
+    reset_runtime_diagnostics,
+    snapshot_runtime_diagnostics,
+    search_tool_efficiency,
+)
+from agent_arcs.langfuse_tracing import LangfuseTraceConfig
 
 DEFAULT_PROMPT = "Write a concise sourced note on Japan's aging market."
 DEFAULT_THREAD_ID = "react-agent-smoke-test"
@@ -79,6 +86,18 @@ def _report_placeholder_issues(article_text: str) -> list[str]:
     return [label for label, needle in checks.items() if needle in lowered]
 
 
+def _looks_like_tool_error(output: str) -> bool:
+    normalized = output.strip().lower()
+    return normalized.startswith("error:") or "tool failed after all retry attempts" in normalized
+
+
+DDGS_TOOL_NAMES = {"search_text", "search_images", "search_news", "search_videos", "search_books", "extract_content"}
+
+
+def _is_ddgs_tool(tool_name: str) -> bool:
+    return tool_name in DDGS_TOOL_NAMES
+
+
 def _format_tool_args(raw_args: object) -> str:
     if raw_args is None:
         return ""
@@ -121,6 +140,12 @@ def _resolve_virtual_path(path_str: str) -> Path:
     return WORKSPACE_ROOT / normalized
 
 
+def _artifact_file_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for candidate in path.rglob("*") if candidate.is_file())
+
+
 def _prompt_with_run_metadata(
     *,
     prompt: str,
@@ -139,8 +164,19 @@ Accessible artifact directories:
 Virtual final report path: {report_path}
 
 Use virtual absolute paths only. Work independently with the available tools; do not delegate or
-reference unavailable subagents. Write the final report to the exact virtual path above. Write
-coverage and citation self-checks under /tmp/review/.
+reference unavailable subagents. Write the final report to the exact virtual path above. Never write
+the complete report in one call: the initial write_file may only create a skeleton/outline, and the
+polished report must emerge through later targeted edit_file calls. After the report exists, read or
+search the current draft and use edit_file section-by-section. Section-by-section means a coherent
+section, subsection, table, or contiguous placeholder edit. Use surgical edits only for localized
+repairs. Never globally replace a bare citation marker such as [10]; anchor citation repairs to the
+surrounding sentence, table row, or reference entry. Write coverage and citation self-checks under
+/tmp/review/. Research and deliverables are text-only: do not use image search, include images, embed
+Markdown images, collect visual assets, or use direct image URLs as report content. For non-trivial
+sourced research, first do a bounded scout, then run a broad multi-aspect discovery sweep across
+several different angles before narrowing into targeted section-level source inspection. For complex
+research tasks, expect roughly 30-50 total DDGS MCP tool calls across discovery, extraction, and
+targeted reading unless the coverage review justifies a narrower or broader budget.
 </run_metadata>
 """
     return metadata + "\n" + prompt
@@ -152,7 +188,12 @@ def _save_run_metrics(
     thread_id: str,
     prompt: str,
     token_usage_by_agent: dict[str, dict[str, int]],
-    tavily_call_counts: dict[str, int],
+    tool_call_counts: dict[str, int],
+    tool_call_counts_by_agent: dict[str, int],
+    tool_error_counts: dict[str, int],
+    ddgs_call_counts: dict[str, int],
+    stream_tool_error_counts: dict[str, int],
+    runtime_diagnostics: dict[str, Any],
     artifact_activity: dict[str, int | list[str]],
 ) -> Path:
     RUN_METRICS_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,9 +209,28 @@ def _save_run_metrics(
         "main_agent_tokens": main_usage,
         "subagents_total_tokens": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         "subagent_tokens_by_name": {},
-        "tavily_tool_calls": {
-            "total": sum(tavily_call_counts.values()),
-            "by_tool": dict(sorted(tavily_call_counts.items())),
+        "tool_calls": {
+            "total": sum(tool_call_counts.values()),
+            "by_tool": dict(sorted(tool_call_counts.items())),
+            "by_agent": dict(sorted(tool_call_counts_by_agent.items())),
+        },
+        "tool_error_results": {
+            "total": sum(tool_error_counts.values()),
+            "by_tool": dict(sorted(tool_error_counts.items())),
+        },
+        "stream_tool_error_events": {
+            "total": sum(stream_tool_error_counts.values()),
+            "by_tool": dict(sorted(stream_tool_error_counts.items())),
+        },
+        "runtime_diagnostics": runtime_diagnostics,
+        "ddgs_tool_calls": {
+            "total": sum(ddgs_call_counts.values()),
+            "by_tool": dict(sorted(ddgs_call_counts.items())),
+        },
+        "ddgs_tool_efficiency": search_tool_efficiency(ddgs_call_counts),
+        "context_engineering_artifacts": {
+            "large_tool_results_file_count": _artifact_file_count(WORKSPACE_ROOT / "large_tool_results"),
+            "conversation_history_file_count": _artifact_file_count(WORKSPACE_ROOT / "conversation_history"),
         },
         "artifact_activity": artifact_activity,
     }
@@ -185,6 +245,7 @@ async def _stream_run(
     *,
     expected_report_path: str | None = None,
     fail_on_incomplete_report: bool = True,
+    langfuse_trace: LangfuseTraceConfig | None = None,
 ) -> StreamRunResult:
     agent_prompt = _prompt_with_run_metadata(
         prompt=prompt,
@@ -201,12 +262,20 @@ async def _stream_run(
     token_usage_by_agent: dict[str, dict[str, int]] = defaultdict(
         lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
-    tavily_call_counts: dict[str, int] = defaultdict(int)
+    tool_call_counts: dict[str, int] = defaultdict(int)
+    tool_call_counts_by_agent: dict[str, int] = defaultdict(int)
+    tool_error_counts: dict[str, int] = defaultdict(int)
+    stream_tool_error_counts: dict[str, int] = defaultdict(int)
+    ddgs_call_counts: dict[str, int] = defaultdict(int)
     artifact_activity: dict[str, int | list[str]] = {
         "subagent_task_calls": 0,
+        "citation_self_checks": 0,
         "report_file_updates": 0,
         "review_file_updates": 0,
         "other_file_updates": 0,
+        "report_write_count": 0,
+        "report_edit_count": 0,
+        "edit_file_failure_count": 0,
         "warnings": [],
     }
 
@@ -214,16 +283,32 @@ async def _stream_run(
     print(_style("Prompt:", BOLD, CYAN), prompt)
     print(_style("-" * 40, DIM, GRAY))
 
+    reset_runtime_diagnostics()
     async with build_react_research_agent() as agent:
+        run_config: dict[str, Any] = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 10_000,
+        }
+        if langfuse_trace is not None:
+            run_config = langfuse_trace.update_langchain_config(run_config)
         async for event in agent.astream_events(
             {"messages": [{"role": "user", "content": agent_prompt}]},
-            config={"configurable": {"thread_id": thread_id}, "recursion_limit": 10_000},
+            config=run_config,
             version="v2",
         ):
             event_type = event.get("event")
             metadata = event.get("metadata", {}) or {}
             data = event.get("data", {}) or {}
             agent_name = _normalize_agent_name(metadata.get("lc_agent_name"))
+
+            if langfuse_trace is not None and event_type in {
+                "on_chain_start",
+                "on_chain_end",
+                "on_chat_model_end",
+                "on_tool_end",
+                "on_tool_error",
+            }:
+                langfuse_trace.flush_if_due()
 
             if root_run_id is None and event_type == "on_chain_start" and event.get("name") == "LangGraph":
                 root_run_id = str(event.get("run_id") or "")
@@ -263,6 +348,8 @@ async def _stream_run(
             if event_type == "on_tool_start":
                 tool_name = str(event.get("name") or "")
                 run_id = str(event.get("run_id") or "")
+                tool_call_counts[tool_name] += 1
+                tool_call_counts_by_agent[agent_name] += 1
                 key = (tool_name, run_id)
                 if key not in shown_tool_calls:
                     shown_tool_calls.add(key)
@@ -274,14 +361,25 @@ async def _stream_run(
                     if isinstance(file_path, str):
                         if file_path.startswith("/report/"):
                             artifact_activity["report_file_updates"] = int(artifact_activity["report_file_updates"]) + 1
+                            if tool_name == "write_file":
+                                artifact_activity["report_write_count"] = int(artifact_activity["report_write_count"]) + 1
+                            elif tool_name == "edit_file":
+                                artifact_activity["report_edit_count"] = int(artifact_activity["report_edit_count"]) + 1
                             if file_path.endswith(".md"):
                                 report_file_candidates.append(_resolve_virtual_path(file_path))
                         elif file_path.startswith("/tmp/review/"):
                             artifact_activity["review_file_updates"] = int(artifact_activity["review_file_updates"]) + 1
+                            if file_path.endswith("/citation_audit.md") or file_path.endswith("/citation_self_check.md"):
+                                artifact_activity["citation_self_checks"] = int(artifact_activity["citation_self_checks"]) + 1
                         else:
                             artifact_activity["other_file_updates"] = int(artifact_activity["other_file_updates"]) + 1
-                if tool_name.startswith("tavily_"):
-                    tavily_call_counts[tool_name] += 1
+                if _is_ddgs_tool(tool_name):
+                    ddgs_call_counts[tool_name] += 1
+                continue
+
+            if event_type == "on_tool_error":
+                tool_name = str(event.get("name") or "")
+                stream_tool_error_counts[tool_name] += 1
                 continue
 
             if event_type != "on_tool_end":
@@ -293,7 +391,12 @@ async def _stream_run(
             if key in shown_tool_results:
                 continue
             shown_tool_results.add(key)
-            preview = _truncate(str(data.get("output", "")))
+            output = str(data.get("output", ""))
+            if _looks_like_tool_error(output):
+                tool_error_counts[tool_name] += 1
+                if tool_name == "edit_file":
+                    artifact_activity["edit_file_failure_count"] = int(artifact_activity["edit_file_failure_count"]) + 1
+            preview = _truncate(output)
             if preview:
                 print()
                 print(_style(f"[tool:{tool_name}]", BOLD, BLUE), preview)
@@ -311,10 +414,27 @@ async def _stream_run(
             f"output={main_usage['output_tokens']}, total={main_usage['total_tokens']}"
         )
         print("subagents total tokens: input=0, output=0, total=0")
-        tavily_total = sum(tavily_call_counts.values())
-        print(f"Tavily tool calls: total={tavily_total}")
-        for tool_name in sorted(tavily_call_counts):
-            print(f"  {tool_name}: {tavily_call_counts[tool_name]}")
+        tool_total = sum(tool_call_counts.values())
+        tool_error_total = sum(tool_error_counts.values())
+        runtime_diagnostics = snapshot_runtime_diagnostics()
+        print(f"Tool calls: total={tool_total}")
+        for tool_name in sorted(tool_call_counts):
+            print(f"  {tool_name}: {tool_call_counts[tool_name]}")
+        print(f"Tool error-like results: total={tool_error_total}")
+        for tool_name in sorted(tool_error_counts):
+            print(f"  {tool_name}: {tool_error_counts[tool_name]}")
+
+        ddgs_total = sum(ddgs_call_counts.values())
+        print(f"DDGS tool calls: total={ddgs_total}")
+        for tool_name in sorted(ddgs_call_counts):
+            print(f"  {tool_name}: {ddgs_call_counts[tool_name]}")
+        print(
+            "runtime diagnostics: "
+            f"tool_retries={runtime_diagnostics['tool_retry_count']}, "
+            f"model_retries={runtime_diagnostics['model_retry_count']}, "
+            f"failed_tools={runtime_diagnostics['failed_tool_call_count']}, "
+            f"summarizations={runtime_diagnostics['summarization_count']}"
+        )
 
         warnings = artifact_activity["warnings"]
         if not isinstance(warnings, list):
@@ -325,7 +445,11 @@ async def _stream_run(
         print(
             "artifact activity: "
             f"subagent_tasks=0, report_updates={artifact_activity['report_file_updates']}, "
-            f"review_updates={artifact_activity['review_file_updates']}"
+            f"report_writes={artifact_activity['report_write_count']}, "
+            f"report_edits={artifact_activity['report_edit_count']}, "
+            f"edit_failures={artifact_activity['edit_file_failure_count']}, "
+            f"review_updates={artifact_activity['review_file_updates']}, "
+            f"citation_self_checks={artifact_activity['citation_self_checks']}"
         )
         for warning in warnings:
             print(_style(f"WARNING: {warning}", BOLD, YELLOW))
@@ -336,7 +460,12 @@ async def _stream_run(
             thread_id=thread_id,
             prompt=agent_prompt,
             token_usage_by_agent=dict(token_usage_by_agent),
-            tavily_call_counts=dict(tavily_call_counts),
+            tool_call_counts=dict(tool_call_counts),
+            tool_call_counts_by_agent=dict(tool_call_counts_by_agent),
+            tool_error_counts=dict(tool_error_counts),
+            ddgs_call_counts=dict(ddgs_call_counts),
+            stream_tool_error_counts=dict(stream_tool_error_counts),
+            runtime_diagnostics=runtime_diagnostics,
             artifact_activity=artifact_activity,
         )
         print(f"metrics saved: {metrics_path}")

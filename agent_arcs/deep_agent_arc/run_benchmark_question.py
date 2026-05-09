@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +27,8 @@ MAX_COMPLETION_ATTEMPTS = int(os.getenv("DEEP_AGENT_MAX_COMPLETION_ATTEMPTS", "3
 
 from agent_arcs.citation_integrity import citation_integrity_failure
 from agent_arcs.costs import estimate_run_cost
+from agent_arcs.diagnostic_metrics import research_breadth_metrics, source_metrics_from_text
+from agent_arcs.langfuse_tracing import configure_langfuse
 
 
 def _load_env_file(env_path: Path) -> None:
@@ -77,6 +80,7 @@ def _ensure_workspace(q_no: int) -> dict[str, Path]:
         "review": arch_root / "tmp" / "review",
         "run_metrics": arch_root / "run_metrics",
         "large_tool_results": arch_root / "large_tool_results",
+        "conversation_history": arch_root / "conversation_history",
         "race": arch_root / "race",
         "fact": arch_root / "fact",
     }
@@ -135,6 +139,82 @@ def _activity_count(activity: dict[str, Any], key: str) -> int:
         return int(activity.get(key, 0) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _metric_float(metrics: dict[str, Any], key: str) -> float:
+    try:
+        return float(metrics.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _total_tokens(usage: dict[str, Any]) -> int:
+    return int(
+        (usage.get("main_agent_tokens", {}) or {}).get("total_tokens", 0) or 0
+    ) + int((usage.get("subagents_total_tokens", {}) or {}).get("total_tokens", 0) or 0)
+
+
+def _langfuse_score_payload(
+    *,
+    race_metrics: dict[str, float],
+    fact_metrics: dict[str, float],
+    source_metrics: dict[str, Any],
+    research_breadth: dict[str, Any],
+    usage: dict[str, Any],
+    cost_estimate: dict[str, Any],
+    report_word_count: int,
+    elapsed_seconds: float,
+) -> dict[str, float | int]:
+    scores: dict[str, float | int] = {
+        "report_word_count": report_word_count,
+        "elapsed_seconds": elapsed_seconds,
+        "total_tokens": _total_tokens(usage),
+        "ddgs_calls": int((usage.get("ddgs_tool_calls", {}) or {}).get("total", 0) or 0),
+        "unique_source_count": int(source_metrics.get("unique_source_count", 0) or 0),
+        "unique_domain_count": int(source_metrics.get("unique_domain_count", 0) or 0),
+        "source_domain_entropy": _metric_float(research_breadth, "source_domain_entropy"),
+        "valid_source_breadth": _metric_float(research_breadth, "valid_source_breadth"),
+        "accurate_breadth_score": _metric_float(research_breadth, "accurate_breadth_score"),
+        "summarization_count": int((usage.get("runtime_diagnostics", {}) or {}).get("summarization_count", 0) or 0),
+        "large_tool_results_file_count": int(
+            (usage.get("context_engineering_artifacts", {}) or {}).get("large_tool_results_file_count", 0) or 0
+        ),
+        "conversation_history_file_count": int(
+            (usage.get("context_engineering_artifacts", {}) or {}).get("conversation_history_file_count", 0) or 0
+        ),
+    }
+
+    if race_metrics:
+        scores.update(
+            {
+                "race_overall": _metric_float(race_metrics, "Overall Score"),
+                "race_comprehensiveness": _metric_float(race_metrics, "Comprehensiveness"),
+                "race_insight": _metric_float(race_metrics, "Insight"),
+                "race_instruction_following": _metric_float(race_metrics, "Instruction Following"),
+                "race_readability": _metric_float(race_metrics, "Readability"),
+            }
+        )
+    if fact_metrics:
+        scores.update(
+            {
+                "fact_valid_rate": _metric_float(fact_metrics, "valid_rate"),
+                "fact_total_citations": _metric_float(fact_metrics, "total_citations"),
+                "fact_total_valid_citations": _metric_float(fact_metrics, "total_valid_citations"),
+            }
+        )
+
+    llm_cost = cost_estimate.get("llm", {}) or {}
+    ddgs_cost = cost_estimate.get("ddgs", {}) or {}
+    scores.update(
+        {
+            "estimated_total_cost_usd": _metric_float(cost_estimate, "total_cost_usd"),
+            "estimated_llm_cost_usd": _metric_float(llm_cost, "total_cost_usd"),
+            "estimated_input_llm_cost_usd": _metric_float(llm_cost, "input_cost_usd"),
+            "estimated_output_llm_cost_usd": _metric_float(llm_cost, "output_cost_usd"),
+            "estimated_ddgs_cost_usd": _metric_float(ddgs_cost, "cost_usd"),
+        }
+    )
+    return scores
 
 
 def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
@@ -206,6 +286,21 @@ def _research_handoff_failure(*, usage: dict[str, Any], article_text: str) -> st
     )
 
 
+def _clean_current_run_artifacts(*, paths: dict[str, Path], report_virtual_path: str) -> None:
+    expected_paths = [
+        paths["arch_root"] / report_virtual_path.removeprefix("/"),
+        paths["review"] / "coverage_review.md",
+        paths["review"] / "citation_self_check.md",
+    ]
+    for path in expected_paths:
+        if path.exists():
+            path.unlink()
+    for path in [paths["large_tool_results"], paths["conversation_history"]]:
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+
 def _completion_repair_prompt(
     *,
     base_prompt: str,
@@ -216,7 +311,7 @@ def _completion_repair_prompt(
         base_prompt
         + "\n\nThe previous attempt did not produce a complete final report. Continue this same run now. "
         + f"Read the current report at {report_virtual_path}. If the report file does not exist, create a skeleton/outline first. "
-        + "If it is a skeleton or incomplete, use edit_file section-by-section to replace placeholders and complete sections. Do not rewrite the whole report in one pass. "
+        + "Never write the complete report in one filesystem call. The first report write_file may only create a skeleton/outline; if the report is a skeleton or incomplete, use edit_file section-by-section to replace placeholders and complete sections. Section-by-section means coherent section, subsection, table, or contiguous placeholder edits, not dozens of citation-only edits. Do not rewrite the whole report in one pass. "
         + "Do not stop after saying you will write. "
         + "If the report file exists, your next report action must be edit_file, not another announcement. "
         + "Replace the Executive Summary placeholder first, then continue section-by-section with additional edit_file calls. "
@@ -224,7 +319,7 @@ def _completion_repair_prompt(
         + "Do not print the report body in chat; put report content only inside write_file/edit_file tool calls. "
         + "If prior checkpoint state says research is complete but the usable evidence is missing, rerun only the necessary research. "
         + "Subagents must return detailed findings directly; do not ask them to write evidence files. "
-        + "Use the iterative cycle: read current draft, incorporate each research-agent handoff into /report/ with write_file/edit_file, update todos, then continue. "
+        + "Use the iterative cycle: read current draft, incorporate each research-agent handoff into /report/ with edit_file section-by-section after the skeleton exists, update todos, then continue. Never use edit_file to globally replace a bare citation marker such as [10]; anchor citation repairs to the surrounding sentence, table row, or reference entry. "
         + "Make the report as complete as the question requires without padding. "
         + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, and numbered references. "
         + "Write /tmp/review/coverage_review.md. Write /tmp/review/citation_self_check.md with your citation/reference validation and repair any blocking issues before finalizing. "
@@ -236,11 +331,17 @@ def _clean_eval_outputs(paths: dict[str, Path]) -> None:
     for output in [
         paths["race"] / "raw_results.jsonl",
         paths["race"] / "race_result.txt",
+        paths["race"] / "race_command.log",
         paths["fact"] / "extracted.jsonl",
         paths["fact"] / "deduplicated.jsonl",
         paths["fact"] / "scraped.jsonl",
         paths["fact"] / "validated.jsonl",
         paths["fact"] / "fact_result.txt",
+        paths["fact"] / "fact_step_1.log",
+        paths["fact"] / "fact_step_2.log",
+        paths["fact"] / "fact_step_3.log",
+        paths["fact"] / "fact_step_4.log",
+        paths["fact"] / "fact_step_5.log",
     ]:
         if output.exists():
             output.unlink()
@@ -378,11 +479,17 @@ def _run_fact(
         ],
     ]
 
-    for index, command in enumerate(commands, start=1):
+    expected_outputs = [extracted_path, deduped_path, scraped_path, validated_path, result_path]
+    for index, (command, expected_output) in enumerate(zip(commands, expected_outputs, strict=True), start=1):
         result = _run_command(command, cwd=BENCH_CODE_ROOT)
         _write_process_log(paths["fact"] / f"fact_step_{index}.log", command, result)
         if result.returncode != 0:
             raise RuntimeError(f"FACT step {index} failed; see {paths['fact'] / f'fact_step_{index}.log'}")
+        if not expected_output.exists():
+            raise RuntimeError(
+                f"FACT step {index} completed but did not create {expected_output}; "
+                f"see {paths['fact'] / f'fact_step_{index}.log'}"
+            )
 
     return _parse_key_value_file(result_path)
 
@@ -395,8 +502,8 @@ def _write_benchmark_markdown(q_root: Path) -> None:
     lines = [
         f"# Question {q_root.name.removeprefix('q')} Benchmark",
         "",
-        "| Architecture | Thread ID | RACE Overall | Comprehensiveness | Insight | Instruction Following | Readability | FACT Valid Rate | Total Tokens | Tavily Calls | Est. LLM Cost | Est. Tavily Cost | Est. Total Cost | Research Tasks | Citation Self-Checks | Report Updates | Report |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Architecture | Thread ID | RACE Overall | Comprehensiveness | Insight | Instruction Following | Readability | FACT Valid Rate | Total Tokens | DDGS Calls | Summarizations | Large Result Files | Conversation Files | Unique Sources | Unique Domains | Source Domain Entropy | Valid Source Breadth | Accurate Breadth Score | Est. Input LLM Cost | Est. Output LLM Cost | Est. LLM Cost | Est. DDGS Cost | Est. Total Cost | Scout Tasks | Research Tasks | Citation Self-Checks | Review Updates | Report Writes | Report Edits | Edit Failures | Report |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
 
     for summary in summaries:
@@ -404,21 +511,31 @@ def _write_benchmark_markdown(q_root: Path) -> None:
         fact = summary.get("fact", {}) or {}
         usage = summary.get("usage", {}) or {}
         cost = summary.get("cost_estimate", {}) or {}
+        source_metrics = summary.get("source_metrics", {}) or {}
+        research_breadth = summary.get("research_breadth", {}) or {}
         llm_cost = (cost.get("llm", {}) or {}).get("total_cost_usd", 0.0)
-        tavily_cost = (cost.get("tavily", {}) or {}).get("cost_usd", 0.0)
+        llm_input_cost = (cost.get("llm", {}) or {}).get("input_cost_usd", 0.0)
+        llm_output_cost = (cost.get("llm", {}) or {}).get("output_cost_usd", 0.0)
+        ddgs_cost = (cost.get("ddgs", {}) or {}).get("cost_usd", 0.0)
         total_cost = cost.get("total_cost_usd", 0.0)
         total_tokens = (
             usage.get("main_agent_tokens", {}).get("total_tokens", 0)
             + usage.get("subagents_total_tokens", {}).get("total_tokens", 0)
         )
-        tavily_calls = usage.get("tavily_tool_calls", {}).get("total", 0)
+        ddgs_calls = usage.get("ddgs_tool_calls", {}).get("total", 0)
+        runtime_diagnostics = usage.get("runtime_diagnostics", {}) or {}
+        context_artifacts = usage.get("context_engineering_artifacts", {}) or {}
         artifact_activity = usage.get("artifact_activity", {}) or {}
+        scout_tasks = artifact_activity.get("scout_agent_task_calls", 0)
         research_tasks = artifact_activity.get("research_agent_task_calls", 0)
         self_checks = artifact_activity.get("citation_self_checks", 0)
-        report_updates = artifact_activity.get("report_file_updates", 0)
+        review_updates = artifact_activity.get("review_file_updates", 0)
+        report_writes = artifact_activity.get("report_write_count", 0)
+        report_edits = artifact_activity.get("report_edit_count", 0)
+        edit_failures = artifact_activity.get("edit_file_failure_count", 0)
         report_path = summary.get("report_path") or ""
         lines.append(
-            "| {arch} | `{thread}` | {overall:.4f} | {comp:.4f} | {insight:.4f} | {inst:.4f} | {read:.4f} | {valid:.4f} | {tokens} | {calls} | ${llm_cost:.4f} | ${tavily_cost:.4f} | ${total_cost:.4f} | {research_tasks} | {self_checks} | {updates} | `{report}` |".format(
+            "| {arch} | `{thread}` | {overall:.4f} | {comp:.4f} | {insight:.4f} | {inst:.4f} | {read:.4f} | {valid:.4f} | {tokens} | {calls} | {summarizations} | {large_result_files} | {conversation_files} | {unique_sources} | {unique_domains} | {source_entropy:.4f} | {valid_source_breadth:.4f} | {accurate_breadth_score:.4f} | ${llm_input_cost:.4f} | ${llm_output_cost:.4f} | ${llm_cost:.4f} | ${ddgs_cost:.4f} | ${total_cost:.4f} | {scout_tasks} | {research_tasks} | {self_checks} | {review_updates} | {report_writes} | {report_edits} | {edit_failures} | `{report}` |".format(
                 arch=summary.get("architecture", ""),
                 thread=summary.get("thread_id", ""),
                 overall=race.get("Overall Score", 0.0),
@@ -428,13 +545,27 @@ def _write_benchmark_markdown(q_root: Path) -> None:
                 read=race.get("Readability", 0.0),
                 valid=fact.get("valid_rate", 0.0),
                 tokens=total_tokens,
-                calls=tavily_calls,
+                calls=ddgs_calls,
+                summarizations=runtime_diagnostics.get("summarization_count", 0),
+                large_result_files=context_artifacts.get("large_tool_results_file_count", 0),
+                conversation_files=context_artifacts.get("conversation_history_file_count", 0),
+                unique_sources=source_metrics.get("unique_source_count", 0),
+                unique_domains=source_metrics.get("unique_domain_count", 0),
+                source_entropy=float(research_breadth.get("source_domain_entropy", 0.0) or 0.0),
+                valid_source_breadth=float(research_breadth.get("valid_source_breadth", 0.0) or 0.0),
+                accurate_breadth_score=float(research_breadth.get("accurate_breadth_score", 0.0) or 0.0),
+                llm_input_cost=float(llm_input_cost or 0.0),
+                llm_output_cost=float(llm_output_cost or 0.0),
                 llm_cost=float(llm_cost or 0.0),
-                tavily_cost=float(tavily_cost or 0.0),
+                ddgs_cost=float(ddgs_cost or 0.0),
                 total_cost=float(total_cost or 0.0),
+                scout_tasks=scout_tasks,
                 research_tasks=research_tasks,
                 self_checks=self_checks,
-                updates=report_updates,
+                review_updates=review_updates,
+                report_writes=report_writes,
+                report_edits=report_edits,
+                edit_failures=edit_failures,
                 report=report_path,
             )
         )
@@ -448,6 +579,7 @@ def _print_score_summary(
     report_path: Path | None,
     race_metrics: dict[str, float],
     fact_metrics: dict[str, float],
+    research_breadth: dict[str, Any],
     cost_estimate: dict[str, Any],
     summary_path: Path,
     benchmark_path: Path,
@@ -472,12 +604,21 @@ def _print_score_summary(
             f"valid={fact_metrics.get('total_valid_citations', 0.0):.0f}/"
             f"{fact_metrics.get('total_citations', 0.0):.0f}"
         )
+    if research_breadth:
+        print(
+            "Research breadth: "
+            f"sources={research_breadth.get('unique_source_count', 0)}, "
+            f"domains={research_breadth.get('unique_domain_count', 0)}, "
+            f"entropy={float(research_breadth.get('source_domain_entropy', 0.0) or 0.0):.4f}, "
+            f"valid_source_breadth={float(research_breadth.get('valid_source_breadth', 0.0) or 0.0):.4f}, "
+            f"accurate_breadth={float(research_breadth.get('accurate_breadth_score', 0.0) or 0.0):.4f}"
+        )
     if cost_estimate:
         print(
             "Estimated cost: "
             f"total=${float(cost_estimate.get('total_cost_usd', 0.0) or 0.0):.4f}, "
             f"llm=${float(((cost_estimate.get('llm', {}) or {}).get('total_cost_usd', 0.0)) or 0.0):.4f}, "
-            f"tavily=${float((((cost_estimate.get('tavily', {}) or {}).get('cost_usd', 0.0))) or 0.0):.4f}"
+            f"ddgs=${float((((cost_estimate.get('ddgs', {}) or {}).get('cost_usd', 0.0))) or 0.0):.4f}"
         )
     print(f"summary saved: {summary_path}")
     print(f"benchmark markdown saved: {benchmark_path}")
@@ -494,14 +635,33 @@ async def _run(args: argparse.Namespace) -> None:
     report_virtual_path = f"/report/q{args.q_no}_{ARCH_TYPE}_report.md"
     prompt = (
         question["prompt"].strip()
-        + "\n\nWrite the final polished Markdown report to exactly "
+        + "\n\nProduce the final polished Markdown report at exactly "
         + report_virtual_path
         + ". Use numbered inline citations and a numbered References section with full URLs."
         + " Run coverage review and write a citation self-check; if the self-check finds blocking issues, repair them before finalizing."
+        + " The runtime has prepared a clean virtual workspace for these expected artifacts: "
+        + report_virtual_path
+        + ", /tmp/review/coverage_review.md, and /tmp/review/citation_self_check.md."
+        + " Never write the complete report in one filesystem call. Use write_file for the report path only to create the initial skeleton if it does not exist; that write_file must not contain the full report. After the report exists, all later report writing must use edit_file section-by-section after reading or searching the current file. Use section-sized edits for drafting and surgical edits only for local repairs. Never globally replace a bare citation marker such as [10]; citation repairs must be anchored to the surrounding sentence, table row, or reference entry. You may add, update, delete, move, or rewrite lines as needed, but do it with targeted edit_file calls rather than whole-report rewrites."
+        + " Use write_file for review artifacts only when creating them for the first time; after a review artifact exists, read it and use edit_file for revisions."
+        + " Do not write the report or review artifacts to any other directory."
+        + " Research and deliverables are text-only: do not use image search, include images, embed Markdown images, collect visual assets, or use direct image URLs as report content."
+        + " Every scout-agent or research-agent task prompt must include an explicit DDGS budget line. Use 1-2 calls for the initial scout, 4-8 calls for normal research-agent section work, 8-12 only for source-conflict or multi-source evidence packets, and never give one subagent 20+ calls. A DDGS call means any search_text, search_news, search_books, or extract_content call. Do not use search_images in this text-only workflow. The subagent must stop at the hard limit and return unresolved gaps."
         + " For non-trivial sourced research, first perform only a scout: your first todo list must contain exactly one in-progress scout item and no skeleton, research-batch, synthesis, review, citation-check, or finalization items. After the scout handoff returns, write the report skeleton, then create the detailed plan, then launch follow-up research batches."
     )
 
     os.environ["DEEP_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
+    langfuse_trace = configure_langfuse(
+        architecture=ARCH_TYPE,
+        q_no=args.q_no,
+        thread_id=thread_id,
+        enabled=args.langfuse,
+        base_url=args.langfuse_base_url,
+    )
+    langfuse_message = langfuse_trace.message()
+    if langfuse_message:
+        print(langfuse_message)
+
     run_started_at = time.time()
     start = time.monotonic()
     if args.skip_agent:
@@ -518,6 +678,7 @@ async def _run(args: argparse.Namespace) -> None:
         metrics_path = None
         run_id = None
     else:
+        _clean_current_run_artifacts(paths=paths, report_virtual_path=report_virtual_path)
         from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues, _stream_run
 
         result = None
@@ -529,12 +690,16 @@ async def _run(args: argparse.Namespace) -> None:
                 report_virtual_path=report_virtual_path,
                 attempt=attempt,
             )
-            result = await _stream_run(
-                prompt=run_prompt,
-                thread_id=thread_id,
-                expected_report_path=report_virtual_path,
-                fail_on_incomplete_report=False,
-            )
+            try:
+                result = await _stream_run(
+                    prompt=run_prompt,
+                    thread_id=thread_id,
+                    expected_report_path=report_virtual_path,
+                    fail_on_incomplete_report=False,
+                    langfuse_trace=langfuse_trace,
+                )
+            finally:
+                langfuse_trace.flush()
             article_text = result.article_text
             if result.report_path is None:
                 print(
@@ -616,6 +781,31 @@ async def _run(args: argparse.Namespace) -> None:
         main_model=os.getenv("AI_MODEL"),
         subagent_model=os.getenv("SUB_MODEL"),
     )
+    source_metrics = source_metrics_from_text(article_text)
+    research_breadth = research_breadth_metrics(
+        source_metrics=source_metrics,
+        fact_metrics=fact_metrics,
+        race_metrics=race_metrics,
+    )
+    report_word_count = _report_word_count(article_text)
+    elapsed_seconds = round(time.monotonic() - start, 3)
+    langfuse_trace.record_scores(
+        scores=_langfuse_score_payload(
+            race_metrics=race_metrics,
+            fact_metrics=fact_metrics,
+            source_metrics=source_metrics,
+            research_breadth=research_breadth,
+            usage=usage,
+            cost_estimate=cost_estimate,
+            report_word_count=report_word_count,
+            elapsed_seconds=elapsed_seconds,
+        ),
+        metadata={
+            "run_id": run_id,
+            "report_path": str(report_path) if report_path else None,
+            "metrics_path": str(metrics_path) if metrics_path else None,
+        },
+    )
     summary = {
         "question_id": args.q_no,
         "architecture": ARCH_DIR_NAME,
@@ -626,13 +816,16 @@ async def _run(args: argparse.Namespace) -> None:
         "language": question.get("language"),
         "topic": question.get("topic"),
         "report_path": str(report_path) if report_path else None,
-        "report_word_count": _report_word_count(article_text),
+        "report_word_count": report_word_count,
         "metrics_path": str(metrics_path) if metrics_path else None,
         "race": race_metrics,
         "fact": fact_metrics,
         "usage": usage,
+        "source_metrics": source_metrics,
+        "research_breadth": research_breadth,
         "cost_estimate": cost_estimate,
-        "elapsed_seconds": round(time.monotonic() - start, 3),
+        "langfuse": langfuse_trace.as_summary(),
+        "elapsed_seconds": elapsed_seconds,
         "saved_at": datetime.now(UTC).isoformat(),
     }
     summary_path = paths["arch_root"] / "summary.json"
@@ -644,10 +837,12 @@ async def _run(args: argparse.Namespace) -> None:
         report_path=report_path,
         race_metrics=race_metrics,
         fact_metrics=fact_metrics,
+        research_breadth=research_breadth,
         cost_estimate=cost_estimate,
         summary_path=summary_path,
         benchmark_path=paths["q_root"] / f"q{args.q_no}_bm.md",
     )
+    langfuse_trace.flush()
 
 
 def main() -> None:
@@ -657,6 +852,8 @@ def main() -> None:
     parser.add_argument("--skip-agent", action="store_true", help="Reuse an existing report instead of running the agent.")
     parser.add_argument("--skip-eval", action="store_true", help="Skip RACE and FACT evaluation.")
     parser.add_argument("--force-eval", action="store_true", help="Remove prior RACE/FACT outputs before evaluating.")
+    parser.add_argument("--langfuse", action="store_true", help="Enable optional Langfuse tracing for this run.")
+    parser.add_argument("--langfuse-base-url", help="Langfuse base URL, default http://localhost:3000 or LANGFUSE_BASE_URL.")
     args = parser.parse_args()
     asyncio.run(_run(args))
 

@@ -14,15 +14,17 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     ModelRequest,
     ModelResponse,
-    ModelRetryMiddleware,
-    SummarizationMiddleware,
-    ToolRetryMiddleware,
 )
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_openai import ChatOpenAI
 
-from agent_arcs.mcp_and_tools import tavily_mcp_tools
+from agent_arcs.diagnostic_metrics import (
+    DiagnosticModelRetryMiddleware,
+    DiagnosticSummarizationMiddleware,
+    DiagnosticToolRetryMiddleware,
+)
+from agent_arcs.mcp_and_tools import ddgs_mcp_tools
 from agent_arcs.react_agent_arc.react_agent_prompts import REACT_AGENT_SYSTEM_PROMPT
 
 MAX_RETRIES = 3
@@ -345,21 +347,22 @@ def find_files(pattern: str, path: str = "/") -> str:
 
 def _build_middleware(*, model: ChatOpenAI, model_name: str) -> list[Any]:
     return [
-        SummarizationMiddleware(
+        DiagnosticSummarizationMiddleware(
             model=model,
+            diagnostic_label="react-agent",
             trigger=("tokens", REACT_SUMMARIZATION_TRIGGER_TOKENS),
             keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
             trim_tokens_to_summarize=None,
         ),
         PromptCachingMiddleware(enabled=_supports_explicit_prompt_caching(model_name)),
         PatchToolCallsMiddleware(),
-        ToolRetryMiddleware(
+        DiagnosticToolRetryMiddleware(
             max_retries=3,
             backoff_factor=2.0,
             initial_delay=1.0,
             on_failure=_format_tool_failure,
         ),
-        ModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
+        DiagnosticModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
     ]
 
 
@@ -378,7 +381,7 @@ async def build_react_research_agent() -> AsyncIterator[Any]:
 
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINTER_DB_PATH)) as checkpointer:
         await checkpointer.setup()
-        async with tavily_mcp_tools() as internet_tools:
+        async with ddgs_mcp_tools() as internet_tools:
             agent = create_agent(
                 model=model,
                 tools=[
