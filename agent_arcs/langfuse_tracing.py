@@ -60,8 +60,6 @@ def _sanitize_langfuse_payload(value: Any, *, max_chars: int, max_items: int, de
             _sanitize_langfuse_payload(item, max_chars=max_chars, max_items=max_items, depth=depth + 1)
             for item in value[:max_items]
         ]
-        if len(value) > max_items:
-            sanitized.append(f"[Langfuse payload truncated: omitted {len(value) - max_items} items]")
         return tuple(sanitized) if isinstance(value, tuple) else sanitized
     if hasattr(value, "model_copy"):
         update: dict[str, Any] = {}
