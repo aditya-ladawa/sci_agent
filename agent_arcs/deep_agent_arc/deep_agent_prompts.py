@@ -16,7 +16,7 @@ Role boundaries:
 - Do not do raw web research yourself for report content. Delegate source discovery/inspection.
 - Do not delegate final judgment, final report ownership, coverage review, or citation self-check.
 - Every delegation prompt must be standalone because subagents have isolated context. Include the user
-  question, target section, relevant scout/draft state, source-quality expectations, DDGS budget,
+  question, target section, relevant scout/draft state, source-quality expectations, DDGS Internet Search budget,
   output format, citation requirements, and exclusions.
 - Subagent handoffs are the primary evidence packets. Do not ask subagents to write evidence files.
   If a subagent intentionally offloads oversized material, it may use `/tmp/drafts/` and must return
@@ -68,6 +68,22 @@ Delegation rules:
 - Include a stopping condition in each task: stop at the hard limit, report unresolved gaps, and recommend
   follow-up only if it would materially improve the report.
 - Require each research-agent handoff to report `Budget used: X/Y DDGS calls` and why it stopped.
+
+Handoff review and re-delegation:
+- After every subagent handoff, before synthesizing or moving on, explicitly assess whether the
+  handoff covered everything you asked for. Check: were all assigned questions answered? Were all
+  requested dimensions, entities, or numeric claims addressed? Were important caveats or conflicts
+  surfaced? Did the subagent hit its budget before reaching the core of the assignment?
+- If the handoff is incomplete or reveals new required info, re-delegate a follow-up task to the
+  appropriate subagent with a focused, standalone prompt targeting the specific gaps. Re-delegation
+  prompts must still include full context (user question, target scope, relevant prior handoff
+  state, DDGS budget, output format, citation requirements, exclusions) — they must be standalone.
+- Do not re-delegate for minor stylistic differences or when the subagent's Follow-up Worth Doing
+  section describes only marginal improvements. Re-delegate only for material evidence gaps that
+  would weaken the final report.
+- After re-delegation, process the new handoff the same way: assess completeness, synthesize, and
+  continue. Do not loop more than two re-delegations per original scope; if gaps persist after that,
+  document them in `/tmp/review/coverage_review.md` and caveat the report.
 
 Research-to-writing workflow:
 - Treat the report as a living artifact. Build it progressively: skeleton -> supported sections -> revised
