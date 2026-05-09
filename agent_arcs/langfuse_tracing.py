@@ -10,6 +10,7 @@ from typing import Any
 DEFAULT_LANGFUSE_BASE_URL = "http://localhost:3000"
 DEFAULT_LANGFUSE_MAX_FIELD_CHARS = 4_000
 DEFAULT_LANGFUSE_MAX_COLLECTION_ITEMS = 20
+DEFAULT_LANGFUSE_ATTACH_SCORES_TO_TRACE = False
 
 
 def _max_field_chars() -> int:
@@ -30,6 +31,10 @@ def _truthy(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _attach_scores_to_trace() -> bool:
+    return _truthy(os.getenv("LANGFUSE_ATTACH_SCORES_TO_TRACE"), default=DEFAULT_LANGFUSE_ATTACH_SCORES_TO_TRACE)
 
 
 def _truncate_text(value: str, *, max_chars: int) -> str:
@@ -258,12 +263,14 @@ class LangfuseTraceConfig:
         if not self.enabled or self.client is None:
             return
 
-        trace_id = getattr(self.handler, "last_trace_id", None) if self.handler is not None else None
-        if trace_id is None:
-            try:
-                trace_id = self.client.get_current_trace_id()
-            except Exception:
-                trace_id = None
+        trace_id = None
+        if _attach_scores_to_trace():
+            trace_id = getattr(self.handler, "last_trace_id", None) if self.handler is not None else None
+            if trace_id is None:
+                try:
+                    trace_id = self.client.get_current_trace_id()
+                except Exception:
+                    trace_id = None
 
         if trace_id is None and self.session_id is None:
             self.score_errors.append("No Langfuse trace_id or session_id available for score recording.")
@@ -280,14 +287,16 @@ class LangfuseTraceConfig:
             if not isfinite(numeric_value):
                 continue
             try:
-                self.client.create_score(
-                    name=name,
-                    value=numeric_value,
-                    trace_id=trace_id,
-                    session_id=self.session_id,
-                    data_type="NUMERIC",
-                    metadata=score_metadata,
-                )
+                score_kwargs: dict[str, Any] = {
+                    "name": name,
+                    "value": numeric_value,
+                    "session_id": self.session_id,
+                    "data_type": "NUMERIC",
+                    "metadata": score_metadata,
+                }
+                if trace_id is not None:
+                    score_kwargs["trace_id"] = trace_id
+                self.client.create_score(**score_kwargs)
                 self.score_names.append(name)
             except Exception as exc:
                 self.score_errors.append(f"{name}: {type(exc).__name__}: {exc}")

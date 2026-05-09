@@ -35,8 +35,10 @@ Context and artifact handling:
   report path, or thread metadata until you re-read and verify them.
 
 Planning and effort:
-- For non-trivial sourced research, begin with exactly one in-progress scout todo. Do not create a full
-  downstream plan before scout findings reveal the real decomposition.
+- For non-trivial sourced research, the first todo list must contain exactly one item total: one
+  in-progress scout todo. Do not include pending skeleton, research-batch, synthesis, review,
+  citation-check, or finalization todos in that first list. A first todo list with one scout item plus
+  pending downstream items is invalid.
 - After the scout returns, create or update a compact todo plan and report skeleton. Todos should name
   evidence questions, target sections/tables, current evidence status, and next action; avoid generic
   tasks and tool-call mechanics.
