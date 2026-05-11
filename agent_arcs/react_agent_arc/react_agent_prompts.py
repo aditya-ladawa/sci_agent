@@ -119,6 +119,7 @@ Final report requirements:
   assumptions, caveats, and implications. Avoid padding and low-value repetition.
 - Every substantive factual paragraph, factual table row, quantitative value, date, source-position claim,
   and non-obvious interpretation needs nearby citation support attached to the exact sentence or clause.
+- Do not add citations just to raise counts. Stop when added citations are duplicative or marginal.
 - Use inline numeric citations only: `[1]`, `[2]`, `[1][3]`. Do not use superscripts, footnotes like
   `[^1]`, bare URLs in body text, citation ranges like `[1-3]`, or comma-combined markers like `[1, 3]`.
 - Citation syntax examples: `The policy took effect in 2024 [3].` and `Two studies report similar

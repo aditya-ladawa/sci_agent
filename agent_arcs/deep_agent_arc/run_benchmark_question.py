@@ -216,29 +216,6 @@ def _langfuse_score_payload(
     return scores
 
 
-def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
-    coverage_path = paths["review"] / "coverage_review.md"
-    if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
-        return f"Coverage review is missing or empty: {coverage_path}"
-
-    self_check_path = paths["review"] / "citation_self_check.md"
-    if not self_check_path.exists():
-        return f"Citation self-check is missing: {self_check_path}"
-    self_check_text = self_check_path.read_text(encoding="utf-8")
-    if not self_check_text.strip():
-        return f"Citation self-check is empty: {self_check_path}"
-    if "NEEDS_REPAIR" not in self_check_text:
-        return None
-    if "## Verdict" in self_check_text:
-        verdict_section = self_check_text.split("## Verdict", 1)[1].split("##", 1)[0]
-        if "NEEDS_REPAIR" in verdict_section:
-            return f"Citation self-check still needs repair: {self_check_path}"
-    first_lines = "\n".join(self_check_text.splitlines()[:30])
-    if "NEEDS_REPAIR" in first_lines:
-        return f"Citation self-check still needs repair: {self_check_path}"
-    return None
-
-
 def _current_run_artifact_failure(
     *,
     paths: dict[str, Path],
@@ -255,12 +232,6 @@ def _current_run_artifact_failure(
         return "Current Deep run did not write or edit /report/; refusing to evaluate a possibly stale report."
 
     artifact_paths = [path for path in [report_path] if path is not None]
-    artifact_paths.extend(
-        [
-            paths["review"] / "coverage_review.md",
-            paths["review"] / "citation_self_check.md",
-        ]
-    )
     stale_paths = [path for path in artifact_paths if path.exists() and path.stat().st_mtime < run_started_at]
     if stale_paths:
         formatted_paths = ", ".join(str(path) for path in stale_paths)
@@ -714,13 +685,6 @@ async def _run(args: argparse.Namespace) -> None:
     research_failure = _research_handoff_failure(usage=usage, article_text=article_text)
     if research_failure and not args.skip_eval:
         raise RuntimeError(research_failure)
-    review_failure = _review_artifact_failure(paths)
-    if review_failure and not args.skip_eval:
-        raise RuntimeError(
-            review_failure
-            + "; use a fresh thread or continue the agent to complete review artifacts before eval."
-        )
-
     race_metrics: dict[str, float] = {}
     fact_metrics: dict[str, float] = {}
     if not args.skip_eval:

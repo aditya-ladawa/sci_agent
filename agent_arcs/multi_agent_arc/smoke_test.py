@@ -136,7 +136,28 @@ def _format_tool_args(raw_args: object) -> str:
 def _normalize_agent_name(name: object) -> str:
     if isinstance(name, str) and name.strip():
         return name
-    return SUPERVISOR_NAME
+    return ""
+
+
+def _event_agent_name(metadata: dict[str, Any]) -> str:
+    checkpoint_ns = metadata.get("checkpoint_ns")
+    if isinstance(checkpoint_ns, str) and checkpoint_ns:
+        checkpoint_owner = checkpoint_ns.split(":", 1)[0].strip()
+        if checkpoint_owner in {SUPERVISOR_NAME, SCOUT_AGENT_NAME, RESEARCH_AGENT_NAME}:
+            return checkpoint_owner
+
+    langgraph_node = metadata.get("langgraph_node")
+    if isinstance(langgraph_node, str) and langgraph_node in {SUPERVISOR_NAME, SCOUT_AGENT_NAME, RESEARCH_AGENT_NAME}:
+        return langgraph_node
+
+    langgraph_path = metadata.get("langgraph_path")
+    if isinstance(langgraph_path, tuple):
+        for node in reversed(langgraph_path):
+            if isinstance(node, str) and node in {SUPERVISOR_NAME, SCOUT_AGENT_NAME, RESEARCH_AGENT_NAME}:
+                return node
+
+    normalized = _normalize_agent_name(metadata.get("lc_agent_name"))
+    return normalized or SUPERVISOR_NAME
 
 
 def _extract_usage(usage_metadata: object) -> tuple[int, int, int]:
@@ -319,7 +340,7 @@ async def _stream_run(
             event_type = event.get("event")
             metadata = event.get("metadata", {}) or {}
             data = event.get("data", {}) or {}
-            agent_name = _normalize_agent_name(metadata.get("lc_agent_name"))
+            agent_name = _event_agent_name(metadata)
 
             if langfuse_trace is not None and event_type in {
                 "on_chain_start",

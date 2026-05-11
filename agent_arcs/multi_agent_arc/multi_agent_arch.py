@@ -9,7 +9,6 @@ from typing import Any, AsyncIterator
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import BaseMessage, SystemMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph_supervisor import create_supervisor
 from langchain_openai import ChatOpenAI
@@ -18,7 +17,6 @@ from agent_arcs.diagnostic_metrics import (
     DiagnosticModelRetryMiddleware,
     DiagnosticSummarizationMiddleware,
     DiagnosticToolRetryMiddleware,
-    record_summarization_event,
 )
 from agent_arcs.mcp_and_tools import ddgs_mcp_tools
 from agent_arcs.multi_agent_arc.multi_agent_prompts import (
@@ -42,11 +40,9 @@ SUB_MODEL_TEMPERATURE = 0.6
 SUB_MODEL_REASONING_EFFORT = "low"
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
 MULTI_AGENT_CONTEXT_BUDGET_TOKENS = 262_000
-MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS = int(MULTI_AGENT_CONTEXT_BUDGET_TOKENS * 0.60)
+MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS = int(MULTI_AGENT_CONTEXT_BUDGET_TOKENS * 0.80)
 SUMMARIZATION_KEEP_MESSAGES = 30
-SUPERVISOR_MIN_TAIL_MESSAGES = 8
-SUPERVISOR_TOOL_MESSAGE_CHAR_BUDGET = 4_000
-SUPERVISOR_SUMMARY_TRANSCRIPT_MAX_CHARS = 80_000
+SUMMARIZATION_TRIM_TOKENS = 50_000
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DR_BENCH_ROOT = PROJECT_ROOT / "dr_bench"
 DEFAULT_WORKSPACE_ROOT = DR_BENCH_ROOT / "q0" / "multi_agent_arc"
@@ -69,10 +65,11 @@ def _required_env(name: str) -> str:
 
 
 def _openrouter_extra_body(model_name: str) -> dict[str, Any] | None:
+    extra_body: dict[str, Any] = {"usage": {"include": True}}
     normalized = model_name.lower()
     if normalized.startswith("anthropic/claude"):
-        return {"cache_control": {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}}
-    return None
+        extra_body["cache_control"] = {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}
+    return extra_body
 
 
 def _supports_explicit_prompt_caching(model_name: str) -> bool:
@@ -158,63 +155,6 @@ def _format_tool_failure(error: Exception) -> str:
     )
 
 
-def _message_to_text(message: BaseMessage) -> str:
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-        return "\n".join(parts)
-    return str(content)
-
-
-def _estimate_messages_tokens(messages: list[BaseMessage]) -> int:
-    total_chars = sum(len(_message_to_text(message)) for message in messages)
-    return max(1, round(total_chars / 2.5))
-
-
-def _split_messages_for_summary(messages: list[BaseMessage]) -> tuple[list[BaseMessage], list[BaseMessage]]:
-    if len(messages) <= 1:
-        return [], list(messages)
-
-    tail_keep = min(SUMMARIZATION_KEEP_MESSAGES, len(messages) - 1)
-    if len(messages) <= SUMMARIZATION_KEEP_MESSAGES:
-        tail_keep = min(max(SUPERVISOR_MIN_TAIL_MESSAGES, 1), len(messages) - 1)
-
-    if tail_keep <= 0:
-        return [], list(messages)
-
-    return messages[:-tail_keep], messages[-tail_keep:]
-
-
-def _truncate_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 20] + "\n...[truncated]"
-
-
-def _truncate_message_content(message: BaseMessage) -> BaseMessage:
-    msg_type = getattr(message, "type", None)
-    if msg_type == "human":
-        return message
-    if msg_type == "system":
-        return message
-
-    truncated = _truncate_text(_message_to_text(message), SUPERVISOR_TOOL_MESSAGE_CHAR_BUDGET)
-    if truncated == _message_to_text(message):
-        return message
-    return message.model_copy(update={"content": truncated})
-
-
-def _truncate_tail_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    return [_truncate_message_content(message) for message in messages]
-
-
 def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic_label: str) -> list[Any]:
     return [
         DiagnosticSummarizationMiddleware(
@@ -222,7 +162,7 @@ def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic
             diagnostic_label=diagnostic_label,
             trigger=("tokens", MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS),
             keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
-            trim_tokens_to_summarize=50_000,
+            trim_tokens_to_summarize=SUMMARIZATION_TRIM_TOKENS,
         ),
         PromptCachingMiddleware(enabled=_supports_explicit_prompt_caching(model_name)),
         PatchToolCallsMiddleware(),
@@ -236,13 +176,13 @@ def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic
     ]
 
 
-def _build_supervisor_pre_model_hook(*, summary_model: ChatOpenAI, model_name: str):
+def _build_supervisor_pre_model_hook(*, summary_model: ChatOpenAI):
     summarizer = DiagnosticSummarizationMiddleware(
         model=summary_model,
         diagnostic_label=SUPERVISOR_NAME,
         trigger=("tokens", MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS),
         keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
-        trim_tokens_to_summarize=50_000,
+        trim_tokens_to_summarize=SUMMARIZATION_TRIM_TOKENS,
     )
 
     async def _pre_model_hook(state: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +209,7 @@ async def build_multi_agent_research_agent() -> AsyncIterator[Any]:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["MULTI_AGENT_WORKSPACE_ROOT"] = str(WORKSPACE_ROOT)
 
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINTER_DB_PATH)) as checkpointer:
         await checkpointer.setup()
@@ -303,7 +244,7 @@ async def build_multi_agent_research_agent() -> AsyncIterator[Any]:
                 prompt=MULTI_AGENT_SYSTEM_PROMPT,
                 pre_model_hook=_build_supervisor_pre_model_hook(summary_model=supervisor_model),
                 parallel_tool_calls=False,
-                output_mode="full_history",
+                output_mode="last_message",
                 handoff_tool_prefix="delegate_to_",
                 add_handoff_messages=True,
                 add_handoff_back_messages=True,

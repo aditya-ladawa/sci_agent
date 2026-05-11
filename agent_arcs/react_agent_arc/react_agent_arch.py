@@ -53,10 +53,11 @@ def _required_env(name: str) -> str:
 
 
 def _openrouter_extra_body(model_name: str) -> dict[str, Any] | None:
+    extra_body: dict[str, Any] = {"usage": {"include": True}}
     normalized = model_name.lower()
     if normalized.startswith("anthropic/claude"):
-        return {"cache_control": {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}}
-    return None
+        extra_body["cache_control"] = {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}
+    return extra_body
 
 
 def _supports_explicit_prompt_caching(model_name: str) -> bool:
@@ -128,21 +129,28 @@ def _build_model(model_name: str, temperature: float) -> ChatOpenAI:
     )
 
 
+def _current_workspace_root() -> Path:
+    # Multi-agent reuses these file tools, so resolve the active runtime workspace at call time.
+    workspace = os.getenv("MULTI_AGENT_WORKSPACE_ROOT") or os.getenv("REACT_AGENT_WORKSPACE_ROOT")
+    return Path(workspace or str(DEFAULT_WORKSPACE_ROOT)).resolve()
+
+
 def _ensure_safe_path(path: str) -> Path:
     virtual_path = path if path.startswith("/") else "/" + path
     if ".." in virtual_path or virtual_path.startswith("~"):
         raise ValueError("Path traversal is not allowed.")
 
-    full_path = (WORKSPACE_ROOT / virtual_path.lstrip("/")).resolve()
+    workspace_root = _current_workspace_root()
+    full_path = (workspace_root / virtual_path.lstrip("/")).resolve()
     try:
-        full_path.relative_to(WORKSPACE_ROOT)
+        full_path.relative_to(workspace_root)
     except ValueError:
         raise ValueError(f"Access denied: {path} is outside the workspace.") from None
     return full_path
 
 
 def _virtual_path(path: Path) -> str:
-    return "/" + str(path.relative_to(WORKSPACE_ROOT))
+    return "/" + str(path.relative_to(_current_workspace_root()))
 
 
 def _format_with_line_numbers(content: str, start_line: int = 1) -> str:

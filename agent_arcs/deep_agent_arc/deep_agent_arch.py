@@ -35,7 +35,7 @@ from agent_arcs.mcp_and_tools import ddgs_mcp_tools
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
 AI_MODEL_TEMPERATURE = 0.0
-SUB_MODEL_TEMPERATURE = 0.6
+SUB_MODEL_TEMPERATURE = 0.2
 SUB_MODEL_REASONING_EFFORT = "low"
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
 DEEP_CONTEXT_BUDGET_TOKENS = 262_000
@@ -65,10 +65,11 @@ def _required_env(name: str) -> str:
 
 
 def _openrouter_extra_body(model_name: str) -> dict[str, Any] | None:
+    extra_body: dict[str, Any] = {"usage": {"include": True}}
     normalized = model_name.lower()
     if normalized.startswith("anthropic/claude"):
-        return {"cache_control": {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}}
-    return None
+        extra_body["cache_control"] = {"type": "ephemeral", "ttl": OPENROUTER_PROMPT_CACHE_TTL}
+    return extra_body
 
 
 def _build_model(
@@ -130,7 +131,7 @@ def think_tool(reflection: str) -> str:
     Examples:
         LeadResearcher: "Scout handoff received. 3 major dimensions identified (regulatory,
         market, technical). Delegating research-agent for regulatory section with 6-call budget.
-        Market section has strong scout coverage -- may not need a separate pass."
+        Market section has strong/weak scout coverage -- may not/ may need a separate pass."
         Subagent: "First 2 search_text calls returned 15 candidate pages. 8 look authoritative
         (WHO, NIH, academic journals), 4 are SEO aggregators (skip), 3 need inspection.
         Gap: no primary data on EU market share. Next: extract_content on WHO page, then

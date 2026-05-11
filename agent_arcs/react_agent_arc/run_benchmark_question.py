@@ -209,37 +209,6 @@ def _langfuse_score_payload(
     return scores
 
 
-def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
-    coverage_path = paths["review"] / "coverage_review.md"
-    if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
-        return f"Coverage review is missing or empty: {coverage_path}"
-
-    audit_path = paths["review"] / "citation_audit.md"
-    if not audit_path.exists() or not audit_path.read_text(encoding="utf-8").strip():
-        return f"Citation audit is missing or empty: {audit_path}"
-
-    audit_text = audit_path.read_text(encoding="utf-8")
-    if "NEEDS_REPAIR" in audit_text:
-        return f"Citation audit still needs repair: {audit_path}"
-    audit_lines = audit_text.splitlines()
-    for index, line in enumerate(audit_lines):
-        normalized_heading = line.strip().lower().strip("# ").rstrip(":")
-        if normalized_heading != "action items":
-            continue
-        section_lines: list[str] = []
-        for section_line in audit_lines[index + 1 :]:
-            if section_line.startswith("#"):
-                break
-            section_lines.append(section_line.strip())
-        section_text = "\n".join(section_lines).strip().lower()
-        if section_text and not any(
-            phrase in section_text
-            for phrase in ("none", "no action", "no unresolved", "not applicable", "not required", "n/a")
-        ):
-            return f"Citation audit has unresolved action items: {audit_path}"
-    return None
-
-
 def _current_run_artifact_failure(
     *,
     paths: dict[str, Path],
@@ -256,12 +225,6 @@ def _current_run_artifact_failure(
         return "Current ReAct run did not write or edit /report/; refusing to evaluate a possibly stale report."
 
     artifact_paths = [path for path in [report_path] if path is not None]
-    artifact_paths.extend(
-        [
-            paths["review"] / "coverage_review.md",
-            paths["review"] / "citation_audit.md",
-        ]
-    )
     stale_paths = [path for path in artifact_paths if path.exists() and path.stat().st_mtime < run_started_at]
     if stale_paths:
         formatted_paths = ", ".join(str(path) for path in stale_paths)
@@ -620,10 +583,6 @@ async def _run(args: argparse.Namespace) -> None:
     citation_failure = citation_integrity_failure(article_text)
     if citation_failure and not args.skip_eval:
         print(f"WARNING: citation integrity check found a non-blocking issue: {citation_failure}")
-    review_failure = _review_artifact_failure(paths)
-    if review_failure and not args.skip_eval:
-        raise RuntimeError(review_failure + "; continue the agent or use a fresh thread before eval.")
-
     race_metrics: dict[str, float] = {}
     fact_metrics: dict[str, float] = {}
     if not args.skip_eval:

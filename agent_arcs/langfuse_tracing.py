@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any
 
+from langchain_core.outputs import ChatGeneration, LLMResult
+
 
 DEFAULT_LANGFUSE_BASE_URL = "http://localhost:3000"
 DEFAULT_LANGFUSE_MAX_FIELD_CHARS = 4_000
@@ -139,8 +141,54 @@ class SanitizingLangfuseCallbackHandler:
     def on_custom_event(self, *args: Any, **kwargs: Any) -> Any:
         return self._forward("on_custom_event", *args, **kwargs)
 
-    def on_llm_end(self, *args: Any, **kwargs: Any) -> Any:
-        return self._forward("on_llm_end", *args, **kwargs)
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        from langfuse.langchain.CallbackHandler import _extract_raw_response, _parse_model, _parse_usage
+
+        try:
+            self._handler._log_debug_event(
+                "on_llm_end", run_id, parent_run_id, response=response, kwargs=kwargs
+            )
+            response_generation = response.generations[-1][-1]
+            extracted_response = (
+                self._handler._convert_message_to_dict(response_generation.message)
+                if isinstance(response_generation, ChatGeneration)
+                else _extract_raw_response(response_generation)
+            )
+
+            llm_usage = _parse_usage(response)
+            model = _parse_model(response)
+            generation = self._handler._detach_observation(run_id)
+
+            if generation is not None:
+                update_kwargs: dict[str, Any] = {
+                    "output": _sanitize_langfuse_payload(
+                        extracted_response, max_chars=self._max_chars, max_items=self._max_items
+                    ),
+                    "usage": llm_usage,
+                    "usage_details": llm_usage,
+                    "input": _sanitize_langfuse_payload(
+                        kwargs.get("inputs"), max_chars=self._max_chars, max_items=self._max_items
+                    ),
+                    "model": model,
+                }
+                cost_details = _parse_openrouter_cost_details(response)
+                if cost_details is not None:
+                    update_kwargs["cost_details"] = cost_details
+                generation.update(**update_kwargs).end()
+        except Exception:
+            return self._forward("on_llm_end", response, run_id=run_id, parent_run_id=parent_run_id, **kwargs)
+        finally:
+            self._handler._updated_completion_start_time_memo.discard(run_id)
+            if parent_run_id is None:
+                self._handler._clear_root_run_resume_key(run_id)
+                self._handler._reset(run_id)
 
     def on_llm_error(self, *args: Any, **kwargs: Any) -> Any:
         return self._forward("on_llm_error", *args, **kwargs)
@@ -174,6 +222,50 @@ class SanitizingLangfuseCallbackHandler:
 
     def on_tool_start(self, *args: Any, **kwargs: Any) -> Any:
         return self._forward("on_tool_start", *args, **kwargs)
+
+
+def _response_token_usage(response: LLMResult) -> dict[str, Any] | None:
+    llm_output = response.llm_output or {}
+    token_usage = llm_output.get("token_usage") if isinstance(llm_output, dict) else None
+    if isinstance(token_usage, dict):
+        return token_usage
+
+    for generation in getattr(response, "generations", []) or []:
+        for generation_chunk in generation:
+            message_chunk = getattr(generation_chunk, "message", None)
+            response_metadata = getattr(message_chunk, "response_metadata", None)
+            if isinstance(response_metadata, dict):
+                nested = response_metadata.get("token_usage")
+                if isinstance(nested, dict):
+                    return nested
+    return None
+
+
+def _parse_openrouter_cost_details(response: LLMResult) -> dict[str, float] | None:
+    token_usage = _response_token_usage(response)
+    if not token_usage:
+        return None
+
+    raw_cost_details = token_usage.get("cost_details") if isinstance(token_usage.get("cost_details"), dict) else {}
+    cost_details: dict[str, float] = {}
+
+    prompt_cost = raw_cost_details.get("upstream_inference_prompt_cost")
+    if isinstance(prompt_cost, (int, float)) and isfinite(float(prompt_cost)):
+        cost_details["input"] = float(prompt_cost)
+
+    completion_cost = raw_cost_details.get("upstream_inference_completions_cost")
+    if isinstance(completion_cost, (int, float)) and isfinite(float(completion_cost)):
+        cost_details["output"] = float(completion_cost)
+
+    total_cost = token_usage.get("cost")
+    if isinstance(total_cost, (int, float)) and isfinite(float(total_cost)):
+        cost_details["total"] = float(total_cost)
+    else:
+        upstream_total = raw_cost_details.get("upstream_inference_cost")
+        if isinstance(upstream_total, (int, float)) and isfinite(float(upstream_total)):
+            cost_details["total"] = float(upstream_total)
+
+    return cost_details or None
 
 
 @dataclass(slots=True)
