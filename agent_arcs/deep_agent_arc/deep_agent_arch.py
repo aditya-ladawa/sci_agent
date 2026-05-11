@@ -36,6 +36,7 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
 AI_MODEL_TEMPERATURE = 0.0
 SUB_MODEL_TEMPERATURE = 0.6
+SUB_MODEL_REASONING_EFFORT = "low"
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
 DEEP_CONTEXT_BUDGET_TOKENS = 262_000
 MAIN_SUMMARIZATION_TRIGGER_TOKENS = int(DEEP_CONTEXT_BUDGET_TOKENS * 0.80)
@@ -70,11 +71,18 @@ def _openrouter_extra_body(model_name: str) -> dict[str, Any] | None:
     return None
 
 
-def _build_model(model_name: str, temperature: float) -> ChatOpenAI:
+def _build_model(
+    model_name: str,
+    temperature: float,
+    *,
+    reasoning_effort: str | None = None,
+) -> ChatOpenAI:
     kwargs: dict[str, Any] = {}
     extra_body = _openrouter_extra_body(model_name)
     if extra_body is not None:
         kwargs["extra_body"] = extra_body
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     return ChatOpenAI(
         model=model_name,
@@ -136,7 +144,11 @@ def _build_main_model() -> ChatOpenAI:
 
 
 def _build_sub_model() -> ChatOpenAI:
-    return _build_model(model_name=_required_env("SUB_MODEL"), temperature=SUB_MODEL_TEMPERATURE)
+    return _build_model(
+        model_name=_required_env("SUB_MODEL"),
+        temperature=SUB_MODEL_TEMPERATURE,
+        reasoning_effort=SUB_MODEL_REASONING_EFFORT,
+    )
 
 
 def _build_filesystem_backend() -> FilesystemBackend:
@@ -283,6 +295,7 @@ __all__ = [
     "RUN_ROOT",
     "REVIEW_DIR",
     "SUB_MODEL_TEMPERATURE",
+    "SUB_MODEL_REASONING_EFFORT",
     "SUBAGENT_SUMMARIZATION_TRIGGER_TOKENS",
     "SUMMARIZATION_KEEP_MESSAGES",
     "TMP_DIR",

@@ -12,8 +12,6 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     AgentMiddleware,
-    ClearToolUsesEdit,
-    ContextEditingMiddleware,
     ModelRequest,
     ModelResponse,
 )
@@ -456,16 +454,6 @@ def _build_middleware(*, model: ChatOpenAI, model_name: str) -> list[Any]:
             trim_tokens_to_summarize=None,
         ),
         PromptCachingMiddleware(enabled=_supports_explicit_prompt_caching(model_name)),
-        ContextEditingMiddleware(
-            edits=[
-                ClearToolUsesEdit(
-                    trigger=200_000,
-                    keep=3,
-                    clear_tool_inputs=False,
-                    placeholder="[cleared]",
-                ),
-            ],
-        ),
         PatchToolCallsMiddleware(),
         DiagnosticToolRetryMiddleware(
             max_retries=3,

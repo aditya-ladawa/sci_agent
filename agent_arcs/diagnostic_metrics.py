@@ -86,6 +86,73 @@ def snapshot_runtime_diagnostics() -> dict[str, Any]:
 def record_summarization_event(diagnostic_label: str) -> None:
     _runtime_diagnostics.summarization_count += 1
     _runtime_diagnostics.summarizations_by_agent[diagnostic_label] += 1
+    print(f"\n[{diagnostic_label}] SUMMARIZED", flush=True)
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            elif isinstance(block, dict) and isinstance(block.get("content"), str):
+                parts.append(block["content"])
+        return "\n".join(parts)
+    return str(content) if content is not None else ""
+
+
+def estimate_messages_tokens(messages: Any) -> int:
+    if messages is None:
+        return 0
+    if isinstance(messages, (list, tuple)):
+        return estimate_text_tokens("\n".join(_message_to_text(message) for message in messages))
+    return estimate_text_tokens(_message_to_text(messages))
+
+
+def _message_to_text(message: Any) -> str:
+    if hasattr(message, "content"):
+        return _content_to_text(getattr(message, "content", None))
+    if isinstance(message, dict):
+        if "content" in message:
+            return _content_to_text(message.get("content"))
+        if "messages" in message:
+            return "\n".join(_message_to_text(item) for item in _as_list(message.get("messages")))
+    if isinstance(message, (list, tuple)):
+        return "\n".join(_message_to_text(item) for item in message)
+    return str(message) if message is not None else ""
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def estimate_context_tokens_from_event_data(data: dict[str, Any]) -> int:
+    event_input = data.get("input")
+    if isinstance(event_input, dict):
+        if "messages" in event_input:
+            return estimate_messages_tokens(event_input.get("messages"))
+        if "llm_input_messages" in event_input:
+            return estimate_messages_tokens(event_input.get("llm_input_messages"))
+    if event_input is not None:
+        return estimate_messages_tokens(event_input)
+    return 0
+
+
+def format_context_window(tokens: int, budget_tokens: int) -> str:
+    def _format_k(value: int) -> str:
+        return f"{max(0, round(value / 1000))}K"
+
+    return f"{_format_k(tokens)}/{_format_k(budget_tokens)}"
 
 
 def _model_label(model: Any) -> str:

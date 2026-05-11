@@ -18,12 +18,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent_arcs.diagnostic_metrics import (
+    estimate_context_tokens_from_event_data,
+    format_context_window,
     reset_runtime_diagnostics,
     search_tool_efficiency,
     snapshot_runtime_diagnostics,
 )
 from agent_arcs.langfuse_tracing import LangfuseTraceConfig
 from agent_arcs.multi_agent_arc.multi_agent_arch import (
+    MULTI_AGENT_CONTEXT_BUDGET_TOKENS,
     RESEARCH_AGENT_NAME,
     SCOUT_AGENT_NAME,
     SUPERVISOR_NAME,
@@ -332,6 +335,17 @@ async def _stream_run(
 
             if event_type == "on_chat_model_start":
                 active_model_text[agent_name] = []
+                context_tokens = estimate_context_tokens_from_event_data(data)
+                if current_agent is not None:
+                    print()
+                print(
+                    _style(
+                        f"[{agent_name}] W: {format_context_window(context_tokens, MULTI_AGENT_CONTEXT_BUDGET_TOKENS)}",
+                        BOLD,
+                        GREEN,
+                    )
+                )
+                current_agent = agent_name
                 continue
 
             if event_type == "on_chat_model_stream":

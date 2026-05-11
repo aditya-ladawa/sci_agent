@@ -39,10 +39,14 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
 AI_MODEL_TEMPERATURE = 0.00
 SUB_MODEL_TEMPERATURE = 0.6
+SUB_MODEL_REASONING_EFFORT = "low"
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
 MULTI_AGENT_CONTEXT_BUDGET_TOKENS = 262_000
-MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS = int(MULTI_AGENT_CONTEXT_BUDGET_TOKENS * 0.80)
+MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS = int(MULTI_AGENT_CONTEXT_BUDGET_TOKENS * 0.60)
 SUMMARIZATION_KEEP_MESSAGES = 30
+SUPERVISOR_MIN_TAIL_MESSAGES = 8
+SUPERVISOR_TOOL_MESSAGE_CHAR_BUDGET = 4_000
+SUPERVISOR_SUMMARY_TRANSCRIPT_MAX_CHARS = 80_000
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DR_BENCH_ROOT = PROJECT_ROOT / "dr_bench"
 DEFAULT_WORKSPACE_ROOT = DR_BENCH_ROOT / "q0" / "multi_agent_arc"
@@ -123,11 +127,18 @@ class PromptCachingMiddleware(AgentMiddleware):
         return await handler(self._with_prompt_cache(request))
 
 
-def _build_model(model_name: str, temperature: float) -> ChatOpenAI:
+def _build_model(
+    model_name: str,
+    temperature: float,
+    *,
+    reasoning_effort: str | None = None,
+) -> ChatOpenAI:
     kwargs: dict[str, Any] = {}
     extra_body = _openrouter_extra_body(model_name)
     if extra_body is not None:
         kwargs["extra_body"] = extra_body
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     return ChatOpenAI(
         model=model_name,
@@ -163,7 +174,45 @@ def _message_to_text(message: BaseMessage) -> str:
 
 
 def _estimate_messages_tokens(messages: list[BaseMessage]) -> int:
-    return max(0, round(sum(len(_message_to_text(message)) for message in messages) / 4))
+    total_chars = sum(len(_message_to_text(message)) for message in messages)
+    return max(1, round(total_chars / 2.5))
+
+
+def _split_messages_for_summary(messages: list[BaseMessage]) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    if len(messages) <= 1:
+        return [], list(messages)
+
+    tail_keep = min(SUMMARIZATION_KEEP_MESSAGES, len(messages) - 1)
+    if len(messages) <= SUMMARIZATION_KEEP_MESSAGES:
+        tail_keep = min(max(SUPERVISOR_MIN_TAIL_MESSAGES, 1), len(messages) - 1)
+
+    if tail_keep <= 0:
+        return [], list(messages)
+
+    return messages[:-tail_keep], messages[-tail_keep:]
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 20] + "\n...[truncated]"
+
+
+def _truncate_message_content(message: BaseMessage) -> BaseMessage:
+    msg_type = getattr(message, "type", None)
+    if msg_type == "human":
+        return message
+    if msg_type == "system":
+        return message
+
+    truncated = _truncate_text(_message_to_text(message), SUPERVISOR_TOOL_MESSAGE_CHAR_BUDGET)
+    if truncated == _message_to_text(message):
+        return message
+    return message.model_copy(update={"content": truncated})
+
+
+def _truncate_tail_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    return [_truncate_message_content(message) for message in messages]
 
 
 def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic_label: str) -> list[Any]:
@@ -173,7 +222,7 @@ def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic
             diagnostic_label=diagnostic_label,
             trigger=("tokens", MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS),
             keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
-            trim_tokens_to_summarize=None,
+            trim_tokens_to_summarize=50_000,
         ),
         PromptCachingMiddleware(enabled=_supports_explicit_prompt_caching(model_name)),
         PatchToolCallsMiddleware(),
@@ -187,52 +236,20 @@ def _build_subagent_middleware(*, model: ChatOpenAI, model_name: str, diagnostic
     ]
 
 
-def _build_supervisor_pre_model_hook(*, summary_model: ChatOpenAI):
+def _build_supervisor_pre_model_hook(*, summary_model: ChatOpenAI, model_name: str):
+    summarizer = DiagnosticSummarizationMiddleware(
+        model=summary_model,
+        diagnostic_label=SUPERVISOR_NAME,
+        trigger=("tokens", MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS),
+        keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
+        trim_tokens_to_summarize=50_000,
+    )
+
     async def _pre_model_hook(state: dict[str, Any]) -> dict[str, Any]:
-        messages = list(state.get("messages") or [])
-        if not messages:
-            return {"llm_input_messages": messages}
-
-        if _estimate_messages_tokens(messages) < MULTI_AGENT_SUMMARIZATION_TRIGGER_TOKENS:
-            return {"llm_input_messages": messages}
-
-        if len(messages) <= SUMMARIZATION_KEEP_MESSAGES:
-            return {"llm_input_messages": messages}
-
-        head_messages = messages[:-SUMMARIZATION_KEEP_MESSAGES]
-        tail_messages = messages[-SUMMARIZATION_KEEP_MESSAGES:]
-        transcript = "\n\n".join(
-            f"[{getattr(message, 'type', type(message).__name__)}]\n{_message_to_text(message)}"
-            for message in head_messages
-        )
-        response = await summary_model.ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        "Summarize the earlier conversation for a research supervisor. You must preserve "
-                        "the following categories of information with high fidelity:\n"
-                        "1. User intent: the original research question, requested dimensions, and constraints.\n"
-                        "2. Research plan: current decomposition, section structure, and what has been assigned.\n"
-                        "3. Evidence status: which sections/dimensions have evidence, which are weak or empty.\n"
-                        "4. Source distinctions: key sources found, source quality assessments, and which sources "
-                        "support which claims.\n"
-                        "5. Unresolved gaps: open questions, failed searches, contradictions, and material uncertainties.\n"
-                        "6. File/report paths: exact virtual paths for the report, review artifacts, drafts, and "
-                        "any offloaded evidence.\n"
-                        "7. Citation and review obligations: whether coverage review and citation audit are done, "
-                        "pending citation repairs, and any structural citation issues.\n"
-                        "8. Key findings: concrete numbers, dates, definitions, and evidence-backed conclusions.\n\n"
-                        "Discard: redundant tool outputs, verbose search logs, repeated search snippets, and "
-                        "chatty narration. Preserve actionable state, not process narrative."
-                    )
-                ),
-                SystemMessage(content=f"Earlier conversation to summarize:\n\n{transcript}"),
-            ]
-        )
-        summary_text = _message_to_text(response)
-        summary_message = SystemMessage(content=f"Conversation summary:\n{summary_text}")
-        record_summarization_event(SUPERVISOR_NAME)
-        return {"llm_input_messages": [summary_message, *tail_messages]}
+        result = await summarizer.abefore_model(state, runtime=None)
+        if result is not None:
+            return result
+        return {"llm_input_messages": state.get("messages", [])}
 
     return _pre_model_hook
 
@@ -242,7 +259,11 @@ async def build_multi_agent_research_agent() -> AsyncIterator[Any]:
     model_name = _required_env("AI_MODEL")
     sub_model_name = os.getenv("SUB_MODEL") or model_name
     supervisor_model = _build_model(model_name=model_name, temperature=AI_MODEL_TEMPERATURE)
-    sub_model = _build_model(model_name=sub_model_name, temperature=SUB_MODEL_TEMPERATURE)
+    sub_model = _build_model(
+        model_name=sub_model_name,
+        temperature=SUB_MODEL_TEMPERATURE,
+        reasoning_effort=SUB_MODEL_REASONING_EFFORT,
+    )
 
     CHECKPOINTER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -307,6 +328,7 @@ __all__ = [
     "RESEARCH_AGENT_NAME",
     "REVIEW_DIR",
     "SCOUT_AGENT_NAME",
+    "SUB_MODEL_REASONING_EFFORT",
     "SUMMARIZATION_KEEP_MESSAGES",
     "SUPERVISOR_NAME",
     "TMP_DIR",

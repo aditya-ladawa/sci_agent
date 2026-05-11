@@ -20,14 +20,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent_arcs.deep_agent_arc.deep_agent_arch import (
     CONVERSATION_HISTORY_DIR,
+    DEEP_CONTEXT_BUDGET_TOKENS,
     LARGE_TOOL_RESULTS_DIR,
     REPORTS_DIR,
     WORKSPACE_ROOT,
     build_deep_research_agent,
 )
 from agent_arcs.diagnostic_metrics import (
+    estimate_context_tokens_from_event_data,
     estimate_text_tokens,
     extract_urls,
+    format_context_window,
     reset_runtime_diagnostics,
     snapshot_runtime_diagnostics,
     source_overlap_between_handoffs,
@@ -466,6 +469,17 @@ async def _stream_run(
 
             if event_type == "on_chat_model_start":
                 active_model_text[agent_name] = []
+                context_tokens = estimate_context_tokens_from_event_data(data)
+                if current_agent is not None:
+                    print()
+                print(
+                    _style(
+                        f"[{agent_name}] W: {format_context_window(context_tokens, DEEP_CONTEXT_BUDGET_TOKENS)}",
+                        BOLD,
+                        GREEN,
+                    )
+                )
+                current_agent = agent_name
                 continue
 
             if event_type == "on_chat_model_stream":

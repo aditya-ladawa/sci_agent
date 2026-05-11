@@ -17,8 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent_arcs.react_agent_arc.react_agent_arch import WORKSPACE_ROOT, build_react_research_agent
+from agent_arcs.react_agent_arc.react_agent_arch import (
+    REACT_CONTEXT_BUDGET_TOKENS,
+    WORKSPACE_ROOT,
+    build_react_research_agent,
+)
 from agent_arcs.diagnostic_metrics import (
+    estimate_context_tokens_from_event_data,
+    format_context_window,
     reset_runtime_diagnostics,
     snapshot_runtime_diagnostics,
     search_tool_efficiency,
@@ -315,6 +321,17 @@ async def _stream_run(
 
             if event_type == "on_chat_model_start":
                 active_model_text[agent_name] = []
+                context_tokens = estimate_context_tokens_from_event_data(data)
+                if current_agent is not None:
+                    print()
+                print(
+                    _style(
+                        f"[{agent_name}] W: {format_context_window(context_tokens, REACT_CONTEXT_BUDGET_TOKENS)}",
+                        BOLD,
+                        GREEN,
+                    )
+                )
+                current_agent = agent_name
                 continue
 
             if event_type == "on_chat_model_stream":
