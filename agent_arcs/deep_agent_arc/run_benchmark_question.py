@@ -23,7 +23,6 @@ BENCH_CODE_ROOT = PROJECT_ROOT / "deep_research_bench"
 QUERY_FILE = BENCH_CODE_ROOT / "data" / "prompt_data" / "query.jsonl"
 ARCH_DIR_NAME = "deep_agent_arc"
 ARCH_TYPE = "deep"
-MAX_COMPLETION_ATTEMPTS = int(os.getenv("DEEP_AGENT_MAX_COMPLETION_ATTEMPTS", "6"))
 
 from agent_arcs.citation_integrity import citation_integrity_failure
 from agent_arcs.costs import estimate_run_cost
@@ -299,52 +298,6 @@ def _clean_current_run_artifacts(*, paths: dict[str, Path], report_virtual_path:
         if path.exists():
             shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=True)
-
-
-def _completion_repair_prompt(
-    *,
-    base_prompt: str,
-    report_virtual_path: str,
-    attempt: int,
-    issues: list[str],
-) -> str:
-    issue_text = "; ".join(issues) if issues else "the report or review artifacts are incomplete"
-    return (
-        base_prompt
-        + "\n\nThe previous attempt did not produce a complete final report. Continue this same run now. "
-        + f"Blocking issues to fix before evaluation: {issue_text}. "
-        + f"Read the current report at {report_virtual_path}. If the report file does not exist, create a skeleton/outline first. "
-        + "Never write the complete report in one filesystem call. The first report write_file may only create a skeleton/outline; if the report is a skeleton or incomplete, use edit_file section-by-section to replace placeholders and complete sections. Section-by-section means coherent section, subsection, table, or contiguous placeholder edits, not dozens of citation-only edits. Do not rewrite the whole report in one pass. "
-        + "Do not stop after saying you will write. "
-        + "If the report file exists, your next report action must be edit_file, not another announcement. "
-        + "Replace the Executive Summary placeholder first, then continue section-by-section with additional edit_file calls. "
-        + "You must call write_file or edit_file to update the report before any ordinary message claiming writing progress. "
-        + "Do not print the report body in chat; put report content only inside write_file/edit_file tool calls. "
-        + "If prior checkpoint state says research is complete but the usable evidence is missing, rerun only the necessary research. "
-        + "Subagents must return detailed findings directly; do not ask them to write evidence files. "
-        + "Use the iterative cycle: read current draft, incorporate each research-agent handoff into /report/ with edit_file section-by-section after the skeleton exists, update todos, then continue. Never use edit_file to globally replace a bare citation marker such as [10]; anchor citation repairs to the surrounding sentence, table row, or reference entry. "
-        + "Make the report as complete as the question requires without padding. "
-        + "Include methodology, calculations or comparisons where useful, assumptions, uncertainties, and numbered inline citations. If the report has inline citations such as [1], it must also have a final section exactly named ## References with matching uniquely numbered entries, source titles/names, and full http(s) URLs. "
-        + "If /tmp/review/coverage_review.md or /tmp/review/citation_self_check.md is missing or empty, write it now before doing anything else. Write /tmp/review/citation_self_check.md with your citation/reference validation and repair any blocking issues before finalizing. "
-        + "Do not stop after only stating that checks were done; persist the review files with write_file/edit_file. "
-        + f"Completion repair attempt: {attempt}."
-    )
-
-
-def _completion_blocking_issues(*, article_text: str, paths: dict[str, Path]) -> list[str]:
-    from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues
-
-    issues: list[str] = []
-    if not article_text.strip():
-        issues.append("empty report")
-    issues.extend(_report_placeholder_issues(article_text))
-    citation_failure = citation_integrity_failure(article_text)
-    if citation_failure:
-        issues.append(citation_failure)
-    review_failure = _review_artifact_failure(paths)
-    if review_failure:
-        issues.append(review_failure)
-    return issues
 
 
 def _clean_eval_outputs(paths: dict[str, Path]) -> None:
@@ -704,18 +657,10 @@ async def _run(args: argparse.Namespace) -> None:
 
         result = None
         article_text = ""
-        completion_attempts = MAX_COMPLETION_ATTEMPTS
-        blocking_issues: list[str] = []
-        for attempt in range(1, completion_attempts + 1):
-            run_prompt = prompt if attempt == 1 else _completion_repair_prompt(
-                base_prompt=prompt,
-                report_virtual_path=report_virtual_path,
-                attempt=attempt,
-                issues=blocking_issues,
-            )
+        for attempt in range(1, 3):
             try:
                 result = await _stream_run(
-                    prompt=run_prompt,
+                    prompt=prompt,
                     thread_id=thread_id,
                     expected_report_path=report_virtual_path,
                     fail_on_incomplete_report=False,
@@ -723,31 +668,27 @@ async def _run(args: argparse.Namespace) -> None:
                 )
             finally:
                 langfuse_trace.flush()
-            article_text = result.article_text
-            if result.report_path is None:
-                print(
-                    f"report incomplete after attempt {attempt}/{completion_attempts}: "
-                    f"expected report file was not written at {report_virtual_path}. continuing..."
-                )
-                continue
-            blocking_issues = _completion_blocking_issues(article_text=article_text, paths=paths)
-            if not blocking_issues:
+            if result.report_path is not None:
                 break
-            issue_text = "; ".join(blocking_issues)
             print(
-                f"report incomplete after attempt {attempt}/{completion_attempts}: {issue_text}. "
-                "continuing..."
+                f"report file not written at {report_virtual_path} after attempt {attempt}/2. "
+                "retrying on new thread..."
             )
+            thread_id = (
+                f"{args.thread_id}-retry{attempt}"
+                if args.thread_id
+                else f"q{args.q_no}_{ARCH_TYPE}_{uuid.uuid4().hex[:12]}"
+            )
+            langfuse_trace.session_id = thread_id
+            langfuse_trace.trace_name = f"q{args.q_no}-{ARCH_TYPE}-{thread_id}"
+            langfuse_trace.metadata["thread_id"] = thread_id
         if result is None:
             raise RuntimeError("Agent did not run.")
         if result.report_path is None:
             raise RuntimeError(
-                f"Report file was not written after {completion_attempts} attempts: {report_virtual_path}"
+                f"Report file was not written after 2 attempts: {report_virtual_path}"
             )
-        blocking_issues = _completion_blocking_issues(article_text=article_text, paths=paths)
-        if blocking_issues:
-            issue_text = "; ".join(blocking_issues)
-            raise RuntimeError(f"Report is still incomplete after {completion_attempts} attempts: {issue_text}")
+        article_text = result.article_text
         report_path = result.report_path
         metrics_path = result.metrics_path
         run_id = result.run_id

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
 import re
 import time
 from collections import Counter, defaultdict
@@ -10,7 +11,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from langchain.agents.middleware import ModelRetryMiddleware, SummarizationMiddleware, ToolRetryMiddleware
-from langchain.agents.middleware._retry import calculate_delay, should_retry_exception
 from deepagents.middleware.summarization import SummarizationMiddleware as DeepAgentsSummarizationMiddleware
 
 
@@ -34,6 +34,35 @@ class RuntimeDiagnostics:
 _runtime_diagnostics = RuntimeDiagnostics()
 
 
+def _calculate_retry_delay(
+    retry_number: int,
+    *,
+    backoff_factor: float,
+    initial_delay: float,
+    max_delay: float,
+    jitter: bool,
+) -> float:
+    if backoff_factor == 0.0:
+        delay = initial_delay
+    else:
+        delay = initial_delay * (backoff_factor**retry_number)
+
+    delay = min(delay, max_delay)
+
+    if jitter and delay > 0:
+        jitter_amount = delay * 0.25
+        delay += random.uniform(-jitter_amount, jitter_amount)
+        delay = max(0.0, delay)
+
+    return delay
+
+
+def _should_retry_exception(exc: Exception, retry_on: Any) -> bool:
+    if callable(retry_on):
+        return bool(retry_on(exc))
+    return isinstance(exc, retry_on)
+
+
 def reset_runtime_diagnostics() -> None:
     global _runtime_diagnostics
     _runtime_diagnostics = RuntimeDiagnostics()
@@ -52,6 +81,11 @@ def snapshot_runtime_diagnostics() -> dict[str, Any]:
         "failed_model_calls_by_model": dict(sorted(_runtime_diagnostics.failed_model_calls_by_model.items())),
         "summarizations_by_agent": dict(sorted(_runtime_diagnostics.summarizations_by_agent.items())),
     }
+
+
+def record_summarization_event(diagnostic_label: str) -> None:
+    _runtime_diagnostics.summarization_count += 1
+    _runtime_diagnostics.summarizations_by_agent[diagnostic_label] += 1
 
 
 def _model_label(model: Any) -> str:
@@ -82,13 +116,13 @@ class DiagnosticToolRetryMiddleware(ToolRetryMiddleware):
                 return handler(request)
             except Exception as exc:
                 attempts_made = attempt + 1
-                if not should_retry_exception(exc, self.retry_on):
+                if not _should_retry_exception(exc, self.retry_on):
                     self._record_failure(tool_name)
                     return self._handle_failure(tool_name, tool_call_id, exc, attempts_made)
 
                 if attempt < self.max_retries:
                     self._record_retry(tool_name)
-                    delay = calculate_delay(
+                    delay = _calculate_retry_delay(
                         attempt,
                         backoff_factor=self.backoff_factor,
                         initial_delay=self.initial_delay,
@@ -114,13 +148,13 @@ class DiagnosticToolRetryMiddleware(ToolRetryMiddleware):
                 return await handler(request)
             except Exception as exc:
                 attempts_made = attempt + 1
-                if not should_retry_exception(exc, self.retry_on):
+                if not _should_retry_exception(exc, self.retry_on):
                     self._record_failure(tool_name)
                     return self._handle_failure(tool_name, tool_call_id, exc, attempts_made)
 
                 if attempt < self.max_retries:
                     self._record_retry(tool_name)
-                    delay = calculate_delay(
+                    delay = _calculate_retry_delay(
                         attempt,
                         backoff_factor=self.backoff_factor,
                         initial_delay=self.initial_delay,
@@ -153,13 +187,13 @@ class DiagnosticModelRetryMiddleware(ModelRetryMiddleware):
                 return handler(request)
             except Exception as exc:
                 attempts_made = attempt + 1
-                if not should_retry_exception(exc, self.retry_on):
+                if not _should_retry_exception(exc, self.retry_on):
                     self._record_failure(request.model)
                     return self._handle_failure(exc, attempts_made)
 
                 if attempt < self.max_retries:
                     self._record_retry(request.model)
-                    delay = calculate_delay(
+                    delay = _calculate_retry_delay(
                         attempt,
                         backoff_factor=self.backoff_factor,
                         initial_delay=self.initial_delay,
@@ -180,13 +214,13 @@ class DiagnosticModelRetryMiddleware(ModelRetryMiddleware):
                 return await handler(request)
             except Exception as exc:
                 attempts_made = attempt + 1
-                if not should_retry_exception(exc, self.retry_on):
+                if not _should_retry_exception(exc, self.retry_on):
                     self._record_failure(request.model)
                     return self._handle_failure(exc, attempts_made)
 
                 if attempt < self.max_retries:
                     self._record_retry(request.model)
-                    delay = calculate_delay(
+                    delay = _calculate_retry_delay(
                         attempt,
                         backoff_factor=self.backoff_factor,
                         initial_delay=self.initial_delay,
@@ -208,11 +242,16 @@ class DiagnosticSummarizationMiddleware(SummarizationMiddleware):
         self.diagnostic_label = diagnostic_label
 
     def _record_summarization(self) -> None:
-        _runtime_diagnostics.summarization_count += 1
-        _runtime_diagnostics.summarizations_by_agent[self.diagnostic_label] += 1
+        record_summarization_event(self.diagnostic_label)
 
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         result = super().before_model(state, runtime)
+        if result is not None:
+            self._record_summarization()
+        return result
+
+    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        result = await super().abefore_model(state, runtime)
         if result is not None:
             self._record_summarization()
         return result
@@ -224,8 +263,7 @@ class DiagnosticDeepSummarizationMiddleware(DeepAgentsSummarizationMiddleware):
         self.diagnostic_label = diagnostic_label
 
     def _record_summarization(self) -> None:
-        _runtime_diagnostics.summarization_count += 1
-        _runtime_diagnostics.summarizations_by_agent[self.diagnostic_label] += 1
+        record_summarization_event(self.diagnostic_label)
 
     @staticmethod
     def _has_summarization_update(result: Any) -> bool:

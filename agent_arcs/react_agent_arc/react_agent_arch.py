@@ -12,6 +12,8 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     AgentMiddleware,
+    ClearToolUsesEdit,
+    ContextEditingMiddleware,
     ModelRequest,
     ModelResponse,
 )
@@ -29,7 +31,7 @@ from agent_arcs.react_agent_arc.react_agent_prompts import REACT_AGENT_SYSTEM_PR
 
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
-AI_MODEL_TEMPERATURE = 0.05
+AI_MODEL_TEMPERATURE = 0.0
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
 REACT_CONTEXT_BUDGET_TOKENS = 262_000
 REACT_SUMMARIZATION_TRIGGER_TOKENS = int(REACT_CONTEXT_BUDGET_TOKENS * 0.80)
@@ -66,10 +68,13 @@ def _supports_explicit_prompt_caching(model_name: str) -> bool:
 
 class PromptCachingMiddleware(AgentMiddleware):
     def __init__(self, *, enabled: bool) -> None:
+        super().__init__()
         self.enabled = enabled
 
     def _with_prompt_cache(self, request: ModelRequest) -> ModelRequest:
         if not self.enabled:
+            return request
+        if request.system_message is None:
             return request
 
         content_blocks = list(request.system_message.content_blocks)
@@ -157,8 +162,23 @@ def _format_tool_failure(error: Exception) -> str:
 def list_files(path: str = "/") -> list[dict[str, Any]]:
     """List files and directories under the workspace.
 
+    Use this to inspect what artifacts exist, verify directory structure, or discover
+    file names and timestamps before reading. The output includes file sizes and modification
+    dates, which are useful signals: large files suggest complexity, recent timestamps
+    suggest fresh content, directory listings reveal project organization.
+
+    Do NOT use this to read file contents -- use read_file for that. Do NOT use this
+    for pattern-based file discovery -- use find_files instead.
+
+    For example, list_files("/report/") checks what reports exist, while list_files("/")
+    shows the top-level workspace layout. Empty directories return []. Non-existent paths
+    return []. Permission errors on individual entries are silently skipped.
+
     Args:
-        path: Virtual directory path to list.
+        path: Virtual directory path to list. Defaults to workspace root "/".
+
+    Returns:
+        List of entries, each with path, is_dir, size (bytes), and modified_at (ISO-8601).
     """
 
     try:
@@ -194,10 +214,27 @@ def list_files(path: str = "/") -> list[dict[str, Any]]:
 def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
     """Read a UTF-8 text file with line numbers.
 
+    Use this to inspect file contents after discovering files via list_files or find_files.
+    Always use offset and limit to read only the section you need -- loading entire large
+    files wastes your attention budget. Use search_files first to locate the relevant line
+    range, then read a targeted slice.
+
+    Do NOT use this to create or modify files -- use write_file or edit_file respectively.
+    Do NOT use this to search file contents by pattern -- use search_files.
+
+    For example, read_file("/report/report.md", offset=0, limit=50) peeks at the report
+    opening, read_file("/tmp/drafts/handoff.md", offset=150, limit=100) reads a specific
+    window, and read_file("/report/report.md") reads from the start. Non-existent files
+    return an error. Empty files return "File exists but has empty contents." Offset beyond
+    file length returns an error. Binary/non-UTF-8 files return a decoding error.
+
     Args:
         path: Virtual file path to read.
-        offset: Zero-based line offset.
-        limit: Maximum number of lines to return.
+        offset: Zero-based line offset for slicing into large files. Default 0 (start).
+        limit: Maximum number of lines to return. Default 2000.
+
+    Returns:
+        File contents with line number prefixes, or an error message.
     """
 
     try:
@@ -223,11 +260,25 @@ def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
 
 @tool(parse_docstring=True)
 def write_file(file_path: str, content: str) -> str:
-    """Create a new UTF-8 text file.
+    """Create a new UTF-8 text file. Fails if the file already exists.
+
+    Use this for creating the initial report skeleton, writing review artifacts, or
+    creating draft/audit files. Parent directories are created automatically.
+
+    Do NOT use this to modify an existing file -- use edit_file. Do NOT use this to
+    overwrite existing artifacts -- the failure-on-exists behavior protects prior work.
+
+    For example, write_file("/report/report.md", outline) creates a report
+    skeleton, and write_file("/tmp/review/coverage_review.md", notes) creates a review
+    artifact. Fails with error if the file already exists (use edit_file instead).
+    Fails if the path escapes the workspace. Parent directories are created automatically.
 
     Args:
-        file_path: Virtual file path to create.
-        content: Content to write.
+        file_path: Virtual file path to create (e.g., "/report/report.md").
+        content: Text content to write.
+
+    Returns:
+        Success message with the file path, or an error.
     """
 
     try:
@@ -246,13 +297,31 @@ def write_file(file_path: str, content: str) -> str:
 
 @tool(parse_docstring=True)
 def edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    """Edit a file by replacing exact string occurrences.
+    """Edit an existing file by replacing exact string occurrences.
+
+    Use this to update report sections, fill in placeholder content, repair citations,
+    or expand drafts. The old_string must match exactly (including whitespace). When
+    a string appears multiple times, either provide more surrounding context to make
+    it unique or set replace_all=True.
+
+    Do NOT use this to create new files -- use write_file. Do NOT globally replace bare
+    citation markers like "[10]" -- include the surrounding sentence to anchor the match.
+    If the target text is not found, re-read the relevant section first.
+
+    For example, edit_file("/report/report.md", "## Placeholder", "## Executive Summary")
+    fills a section, and edit_file("/report/report.md", "Sentence with [10].", "Sentence with [11][12].",
+    replace_all=True) repairs citations. Fails if the file or old_string is not found. Fails
+    if old_string appears multiple times without replace_all=True. The match is literal, not regex.
 
     Args:
         file_path: Virtual file path to edit.
-        old_string: Exact string to replace.
+        old_string: Exact string to replace (must match verbatim).
         new_string: Replacement string.
-        replace_all: Whether to replace all occurrences.
+        replace_all: When True, replaces all occurrences. When False (default), fails
+                     if old_string appears more than once.
+
+    Returns:
+        Success message with replacement count, or an error.
     """
 
     try:
@@ -282,10 +351,27 @@ def edit_file(file_path: str, old_string: str, new_string: str, replace_all: boo
 def search_files(pattern: str, path: str = "/", file_pattern: str | None = None) -> str:
     """Search workspace file contents with a regex pattern.
 
+    Use this to locate specific content across files: find where a citation appears,
+    locate a section by heading text, check if a claim exists in a draft, or find
+    line numbers before using read_file with offset. Use file_pattern to narrow
+    the search (e.g., "*.md" for Markdown only).
+
+    Do NOT use this to list files by name -- use find_files. Do NOT use this to read
+    file contents -- use read_file. The search is line-by-line within each file.
+
+    For example, search_files("\\\\[10\\\\]", "/report/", "*.md") finds where citation
+    [10] appears, and search_files("## References", "/report/") finds Reference sections.
+    Returns "No matches found." for empty results. Capped at 100 matches. Binary/non-UTF-8
+    files are silently skipped. Invalid regex returns an error.
+
     Args:
-        pattern: Regex pattern to search for.
-        path: Virtual file or directory path to search under.
-        file_pattern: Optional glob filter such as *.md.
+        pattern: Regex pattern to search for (e.g., "citation", "## References", "\\\\[3\\\\]").
+        path: Virtual file or directory path to search under. Directories are searched
+              recursively; files are searched directly.
+        file_pattern: Optional glob filter like "*.md" or "*.py" to limit search scope.
+
+    Returns:
+        Matching lines with file:line format, up to 100 results. "No matches found." if none.
     """
 
     try:
@@ -323,9 +409,24 @@ def search_files(pattern: str, path: str = "/", file_pattern: str | None = None)
 def find_files(pattern: str, path: str = "/") -> str:
     """Find files matching a glob pattern.
 
+    Use this to discover files by name pattern: find all Markdown reports, locate
+    handoff files, or check what draft artifacts exist. Results are sorted by
+    modification time (newest first), which helps identify the most recent work.
+
+    Do NOT use this to list directory contents with metadata -- use list_files.
+    Do NOT use this to search file contents -- use search_files.
+
+    For example, find_files("*.md", "/report/") finds all reports, find_files("*handoff*",
+    "/tmp/drafts/") finds handoff files, and find_files("**/*.md", "/") finds all Markdown
+    files in the workspace. Returns "No files found." for empty results. Only returns files
+    (not directories). Non-existent paths return "No files found."
+
     Args:
-        pattern: Glob pattern such as *.md or **/*.json.
-        path: Virtual directory path to search under.
+        pattern: Glob pattern like "*.md", "**/*.json", or "*handoff*".
+        path: Virtual directory path to search under recursively.
+
+    Returns:
+        One file path per line, sorted newest first. "No files found." if none.
     """
 
     try:
@@ -355,6 +456,16 @@ def _build_middleware(*, model: ChatOpenAI, model_name: str) -> list[Any]:
             trim_tokens_to_summarize=None,
         ),
         PromptCachingMiddleware(enabled=_supports_explicit_prompt_caching(model_name)),
+        ContextEditingMiddleware(
+            edits=[
+                ClearToolUsesEdit(
+                    trigger=200_000,
+                    keep=3,
+                    clear_tool_inputs=False,
+                    placeholder="[cleared]",
+                ),
+            ],
+        ),
         PatchToolCallsMiddleware(),
         DiagnosticToolRetryMiddleware(
             max_retries=3,

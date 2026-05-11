@@ -20,8 +20,8 @@ if str(PROJECT_ROOT) not in sys.path:
 DR_BENCH_ROOT = PROJECT_ROOT / "dr_bench"
 BENCH_CODE_ROOT = PROJECT_ROOT / "deep_research_bench"
 QUERY_FILE = BENCH_CODE_ROOT / "data" / "prompt_data" / "query.jsonl"
-ARCH_DIR_NAME = "react_agent_arc"
-ARCH_TYPE = "react"
+ARCH_DIR_NAME = "multi_agent_arc"
+ARCH_TYPE = "multi"
 
 from agent_arcs.citation_integrity import citation_integrity_failure
 from agent_arcs.costs import estimate_run_cost
@@ -141,9 +141,9 @@ def _metric_float(metrics: dict[str, Any], key: str) -> float:
 
 
 def _total_tokens(usage: dict[str, Any]) -> int:
-    return int(
-        (usage.get("main_agent_tokens", {}) or {}).get("total_tokens", 0) or 0
-    ) + int((usage.get("subagents_total_tokens", {}) or {}).get("total_tokens", 0) or 0)
+    return int((usage.get("main_agent_tokens", {}) or {}).get("total_tokens", 0) or 0) + int(
+        (usage.get("subagents_total_tokens", {}) or {}).get("total_tokens", 0) or 0
+    )
 
 
 def _langfuse_score_payload(
@@ -175,7 +175,6 @@ def _langfuse_score_payload(
             (usage.get("context_engineering_artifacts", {}) or {}).get("conversation_history_file_count", 0) or 0
         ),
     }
-
     if race_metrics:
         scores.update(
             {
@@ -194,7 +193,6 @@ def _langfuse_score_payload(
                 "fact_total_valid_citations": _metric_float(fact_metrics, "total_valid_citations"),
             }
         )
-
     llm_cost = cost_estimate.get("llm", {}) or {}
     ddgs_cost = cost_estimate.get("ddgs", {}) or {}
     scores.update(
@@ -213,11 +211,9 @@ def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
     coverage_path = paths["review"] / "coverage_review.md"
     if not coverage_path.exists() or not coverage_path.read_text(encoding="utf-8").strip():
         return f"Coverage review is missing or empty: {coverage_path}"
-
     audit_path = paths["review"] / "citation_audit.md"
     if not audit_path.exists() or not audit_path.read_text(encoding="utf-8").strip():
         return f"Citation audit is missing or empty: {audit_path}"
-
     audit_text = audit_path.read_text(encoding="utf-8")
     if "NEEDS_REPAIR" in audit_text:
         return f"Citation audit still needs repair: {audit_path}"
@@ -233,8 +229,7 @@ def _review_artifact_failure(paths: dict[str, Path]) -> str | None:
             section_lines.append(section_line.strip())
         section_text = "\n".join(section_lines).strip().lower()
         if section_text and not any(
-            phrase in section_text
-            for phrase in ("none", "no action", "no unresolved", "not applicable", "not required", "n/a")
+            phrase in section_text for phrase in ("none", "no action", "no unresolved", "not applicable", "not required", "n/a")
         ):
             return f"Citation audit has unresolved action items: {audit_path}"
     return None
@@ -250,18 +245,11 @@ def _current_run_artifact_failure(
     artifact_activity = usage.get("artifact_activity", {}) or {}
     if not artifact_activity:
         return "Run metrics are missing artifact activity, so current-run report ownership cannot be verified."
-
     report_updates = _activity_count(artifact_activity, "report_file_updates")
     if report_updates == 0:
-        return "Current ReAct run did not write or edit /report/; refusing to evaluate a possibly stale report."
-
+        return "Current multi-agent run did not write or edit /report/; refusing to evaluate a possibly stale report."
     artifact_paths = [path for path in [report_path] if path is not None]
-    artifact_paths.extend(
-        [
-            paths["review"] / "coverage_review.md",
-            paths["review"] / "citation_audit.md",
-        ]
-    )
+    artifact_paths.extend([paths["review"] / "coverage_review.md", paths["review"] / "citation_audit.md"])
     stale_paths = [path for path in artifact_paths if path.exists() and path.stat().st_mtime < run_started_at]
     if stale_paths:
         formatted_paths = ", ".join(str(path) for path in stale_paths)
@@ -303,23 +291,14 @@ def _clean_eval_outputs(paths: dict[str, Path]) -> None:
             output.unlink()
 
 
-def _run_race(
-    *,
-    q_no: int,
-    question: dict[str, Any],
-    article_text: str,
-    paths: dict[str, Path],
-    force: bool,
-) -> dict[str, float]:
+def _run_race(*, q_no: int, question: dict[str, Any], article_text: str, paths: dict[str, Path], force: bool) -> dict[str, float]:
     model_name = f"q{q_no}_{ARCH_TYPE}"
     raw_data_dir = paths["race"] / "raw_data"
     cleaned_data_dir = paths["race"] / "cleaned_data"
     raw_data_path = raw_data_dir / f"{model_name}.jsonl"
     query_path = paths["race"] / "query.jsonl"
-
     _write_jsonl(query_path, [question])
     _write_jsonl(raw_data_path, [{"id": q_no, "prompt": question["prompt"], "article": article_text}])
-
     command = [
         sys.executable,
         "deepresearch_bench_race.py",
@@ -341,7 +320,6 @@ def _run_race(
         command.append("--only_zh")
     if force:
         command.append("--force")
-
     result = _run_command(command, cwd=BENCH_CODE_ROOT)
     _write_process_log(paths["race"] / "race_command.log", command, result)
     if result.returncode != 0:
@@ -357,10 +335,8 @@ def _run_fact(*, q_no: int, question: dict[str, Any], article_text: str, paths: 
     scraped_path = paths["fact"] / "scraped.jsonl"
     validated_path = paths["fact"] / "validated.jsonl"
     result_path = paths["fact"] / "fact_result.txt"
-
     _write_jsonl(query_path, [question])
     _write_jsonl(raw_data_path, [{"id": q_no, "prompt": question["prompt"], "article": article_text}])
-
     commands = [
         [sys.executable, "-m", "utils.extract", "--output_path", str(extracted_path), "--raw_data_path", str(raw_data_path), "--query_data_path", str(query_path), "--n_total_process", "1"],
         [sys.executable, "-m", "utils.deduplicate", "--output_path", str(deduped_path), "--raw_data_path", str(extracted_path), "--query_data_path", str(query_path), "--n_total_process", "1"],
@@ -368,7 +344,6 @@ def _run_fact(*, q_no: int, question: dict[str, Any], article_text: str, paths: 
         [sys.executable, "-m", "utils.validate", "--output_path", str(validated_path), "--raw_data_path", str(scraped_path), "--query_data_path", str(query_path), "--n_total_process", "4"],
         [sys.executable, "-m", "utils.stat", "--input_path", str(validated_path), "--output_path", str(result_path)],
     ]
-
     expected_outputs = [extracted_path, deduped_path, scraped_path, validated_path, result_path]
     for index, (command, expected_output) in enumerate(zip(commands, expected_outputs, strict=True), start=1):
         result = _run_command(command, cwd=BENCH_CODE_ROOT)
@@ -377,8 +352,7 @@ def _run_fact(*, q_no: int, question: dict[str, Any], article_text: str, paths: 
             raise RuntimeError(f"FACT step {index} failed; see {paths['fact'] / f'fact_step_{index}.log'}")
         if not expected_output.exists():
             raise RuntimeError(
-                f"FACT step {index} completed but did not create {expected_output}; "
-                f"see {paths['fact'] / f'fact_step_{index}.log'}"
+                f"FACT step {index} completed but did not create {expected_output}; see {paths['fact'] / f'fact_step_{index}.log'}"
             )
     return _parse_key_value_file(result_path)
 
@@ -387,7 +361,6 @@ def _write_benchmark_markdown(q_root: Path) -> None:
     summaries: list[dict[str, Any]] = []
     for summary_path in sorted(q_root.glob("*_agent_arc/summary.json")):
         summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
-
     lines = [
         f"# Question {q_root.name.removeprefix('q')} Benchmark",
         "",
@@ -455,17 +428,7 @@ def _write_benchmark_markdown(q_root: Path) -> None:
     (q_root / f"{q_root.name}_bm.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _print_score_summary(
-    *,
-    q_no: int,
-    report_path: Path | None,
-    race_metrics: dict[str, float],
-    fact_metrics: dict[str, float],
-    research_breadth: dict[str, Any],
-    cost_estimate: dict[str, Any],
-    summary_path: Path,
-    benchmark_path: Path,
-) -> None:
+def _print_score_summary(*, q_no: int, report_path: Path | None, race_metrics: dict[str, float], fact_metrics: dict[str, float], research_breadth: dict[str, Any], cost_estimate: dict[str, Any], summary_path: Path, benchmark_path: Path) -> None:
     print("\nEvaluation complete.")
     print(f"Question: q{q_no}")
     if report_path is not None:
@@ -483,8 +446,7 @@ def _print_score_summary(
         print(
             "FACT: "
             f"valid_rate={fact_metrics.get('valid_rate', 0.0):.4f}, "
-            f"valid={fact_metrics.get('total_valid_citations', 0.0):.0f}/"
-            f"{fact_metrics.get('total_citations', 0.0):.0f}"
+            f"valid={fact_metrics.get('total_valid_citations', 0.0):.0f}/{fact_metrics.get('total_citations', 0.0):.0f}"
         )
     if research_breadth:
         print(
@@ -528,13 +490,12 @@ async def _run(args: argparse.Namespace) -> None:
         + " Never write the complete report in one filesystem call. Use write_file for the report path only to create the initial skeleton if it does not exist; that write_file must not contain the full report. After the report exists, all later report writing must use edit_file section-by-section after reading or searching the current file. Section-by-section means coherent section, subsection, table, or contiguous placeholder edits, not dozens of citation-only edits. Use section-sized edits for drafting and surgical edits only for localized repairs. Never globally replace a bare citation marker such as [10]; citation repairs must be anchored to the surrounding sentence, table row, or reference entry. You may add, update, delete, move, or rewrite lines as needed, but do it with targeted edit_file calls rather than whole-report rewrites. Use write_file for review artifacts only when creating them for the first time; after a file exists, read it and use edit_file for revisions."
         + " Do not write the report or review artifacts to any other directory."
         + " Research and deliverables are text-only: do not use image search, include images, embed Markdown images, collect visual assets, or use direct image URLs as report content."
-        + " For non-trivial sourced research, first do a bounded scout to map terminology, source types, major dimensions, and likely uncertainty hotspots. After the scout, begin with a broad multi-aspect discovery sweep across several materially different angles before narrowing into section-level source inspection and synthesis."
+        + " For non-trivial sourced research, first do a bounded scout to map terminology, source types, major dimensions, and likely uncertainty hotspots. After the scout, continue with targeted research-agent passes for every material dimension until each is supported by cited evidence or explicitly documented as unavailable in the coverage review."
         + " For complex research tasks, target roughly 30-50 total DDGS MCP tool calls across discovery, extraction, and targeted reading. Use fewer only when the task is narrow or repeated targeted searches are duplicative; exceed 50 only when a material section remains weak and explain why in the coverage review."
-        + " For broad multi-region or multi-entity questions, do not finalize after only a small initial landscape pass. Continue with targeted passes for every requested dimension until each is supported by cited evidence or explicitly documented as unavailable in the coverage review."
         + " For broad legal, policy, scientific, cultural, or industry questions, apply the same standard: continue beyond a general overview until the draft has inspected cited evidence for each material dimension, including concrete examples, governing frameworks, counterarguments, and remedy tradeoffs. The coverage review must state the approximate number of unique credible sources in the final References section and explain any justified shortfall below 25."
     )
 
-    os.environ["REACT_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
+    os.environ["MULTI_AGENT_WORKSPACE_ROOT"] = str(paths["arch_root"])
     langfuse_trace = configure_langfuse(
         architecture=ARCH_TYPE,
         q_no=args.q_no,
@@ -553,7 +514,7 @@ async def _run(args: argparse.Namespace) -> None:
         if not report_path.exists():
             raise FileNotFoundError(f"Expected existing report at {report_path}")
         article_text = report_path.read_text(encoding="utf-8")
-        from agent_arcs.react_agent_arc.smoke_test import _report_placeholder_issues
+        from agent_arcs.multi_agent_arc.smoke_test import _report_placeholder_issues
 
         placeholder_issues = _report_placeholder_issues(article_text)
         if placeholder_issues:
@@ -562,7 +523,7 @@ async def _run(args: argparse.Namespace) -> None:
         run_id = None
     else:
         _clean_current_run_artifacts(paths=paths, report_virtual_path=report_virtual_path)
-        from agent_arcs.react_agent_arc.smoke_test import _stream_run
+        from agent_arcs.multi_agent_arc.smoke_test import _stream_run
 
         result = None
         article_text = ""
@@ -594,9 +555,7 @@ async def _run(args: argparse.Namespace) -> None:
         if result is None:
             raise RuntimeError("Agent did not run.")
         if result.report_path is None:
-            raise RuntimeError(
-                f"Report file was not written after 2 attempts: {report_virtual_path}"
-            )
+            raise RuntimeError(f"Report file was not written after 2 attempts: {report_virtual_path}")
         article_text = result.article_text
         report_path = result.report_path
         metrics_path = result.metrics_path
@@ -632,10 +591,7 @@ async def _run(args: argparse.Namespace) -> None:
         print("Running FACT evaluation...")
         fact_metrics = _run_fact(q_no=args.q_no, question=question, article_text=article_text, paths=paths)
 
-    cost_estimate = estimate_run_cost(
-        usage=usage,
-        main_model=os.getenv("AI_MODEL"),
-    )
+    cost_estimate = estimate_run_cost(usage=usage, main_model=os.getenv("AI_MODEL"))
     source_metrics = source_metrics_from_text(article_text)
     research_breadth = research_breadth_metrics(
         source_metrics=source_metrics,

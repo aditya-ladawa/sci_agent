@@ -32,19 +32,82 @@ def _default_ddgs_command() -> str:
     return "ddgs"
 
 
+_TOOL_GUIDANCE: dict[str, str] = {
+    "search_text": (
+        "\n\nWhen to use: broad topic discovery, finding specific facts/entities/data, "
+        "locating primary sources, exploring terminology, and initial landscape mapping. "
+        "This is the default discovery tool for most research needs."
+        "\nWhen NOT to use: you already have the exact URL and need its full content (use extract_content "
+        "instead), you need recent news specifically (use search_news), you need book/academic references "
+        "specifically (use search_books), or you are searching for images/video (forbidden in this workflow)."
+        "\nSearch strategy: start with short, broad queries (2-4 words) to map the landscape, then narrow "
+        "with specific terms, entities, dates, or constraints. Do not start with overly long specific queries."
+        "\nExamples:"
+        "\n  Good: search_text(query='CRISPR gene therapy') → maps landscape, shows major players and terms"
+        "\n  Good: search_text(query='CRISPR sickle cell 2024 clinical trial') → narrows after landscape known"
+        "\n  Bad: search_text(query='comprehensive systematic review of all CRISPR gene therapy clinical trials for sickle cell disease published between 2020 and 2025') → too long, too specific first"
+        "\nEdge cases: if results are empty, shorten the query or try synonyms. If results are all SEO farms, "
+        "add site: qualifiers or switch to search_news/search_books for authoritative sources."
+    ),
+    "search_news": (
+        "\n\nWhen to use: recent events, time-sensitive claims, current developments, press releases, "
+        "regulatory announcements, and verifying whether something is current or outdated."
+        "\nWhen NOT to use: historical facts, academic research, static reference material, or when "
+        "search_text would return better authoritative sources. Do not use for image/video search."
+        "\nExamples:"
+        "\n  Good: search_news(query='EU AI Act enforcement') → finds current regulatory developments"
+        "\n  Good: search_news(query='FDA drug approval 2025') → finds recent approvals"
+        "\n  Bad: search_news(query='history of quantum mechanics') → not time-sensitive, use search_text or search_books"
+        "\nEdge cases: news results may overlap with search_text. If search_text already found recent coverage, "
+        "prefer those sources unless you need specifically dated press coverage."
+    ),
+    "search_books": (
+        "\n\nWhen to use: academic/literary references, in-depth treatment of topics, textbook-level "
+        "explanations, and finding authoritative long-form sources."
+        "\nWhen NOT to use: current events, recent developments, quick factual lookups, or when "
+        "search_text returns sufficient results. Do not use for image/video search."
+        "\nExamples:"
+        "\n  Good: search_books(query='reinforcement learning theory') → finds textbooks and monographs"
+        "\n  Good: search_books(query='international trade law WTO') → finds authoritative legal references"
+        "\n  Bad: search_books(query='stock market today') → use search_news for current data"
+        "\nEdge cases: book results may be older. For topics needing recent publications, combine with "
+        "search_text or search_news to find papers and preprints."
+    ),
+    "extract_content": (
+        "\n\nWhen to use: inspecting the full text of a specific URL you already have, verifying whether "
+        "a cited source actually supports a claim, extracting specific data/tables/numbers from a known page, "
+        "and reading deep content that snippets cannot convey."
+        "\nWhen NOT to use: discovering new URLs or topics (use search_text/search_news/search_books first), "
+        "when a search snippet already answers your question, or when you need to find sources rather than "
+        "read one. Do not use for image/video extraction."
+        "\nEfficiency: extract only high-value pages, not every search result. A page is worth extracting "
+        "when it likely contains primary data, official statements, detailed specifications, or evidence "
+        "for a specific claim."
+        "\nExamples:"
+        "\n  Good: extract_content(url='https://who.int/publications/2024-malaria-report') → reads full official report"
+        "\n  Good: extract_content(url='https://arxiv.org/abs/2401.12345') → reads paper abstract/intro for claims"
+        "\n  Bad: extract_content(url='https://en.wikipedia.org/wiki/Quantum_computing') → search snippet suffices for overview"
+        "\nEdge cases: if extraction returns an error or paywall, note it in your handoff, try search_text with "
+        "site: prefix for cached/indexed content, or search for alternative sources covering the same data. "
+        "Do not retry the same failing URL."
+    ),
+}
+
+_SHARED_DDGS_GUIDANCE = (
+    "\n\nThis DDGS MCP tool is part of Dux Distributed Global Search. "
+    "This workflow is text-only; do not use image search, include images, embed Markdown images, "
+    "collect visual assets, or use direct image URLs as report content. "
+    "If a tool returns an error, empty result, inaccessible page, or low-quality output, preserve "
+    "the exact error/result in your notes, then retry with changed query terms, source type, or angle. "
+    "Do not infer missing facts from failed searches."
+)
+
+
 def _augment_tool_description(tool: BaseTool) -> BaseTool:
+    tool_name = getattr(tool, "name", "") or ""
     description = getattr(tool, "description", "") or ""
-    guidance = (
-        "\n\nReliability guidance for agents: this DDGS MCP tool is part of Dux Distributed "
-        "Global Search, a metasearch library. Available DDGS tools include search_text, "
-        "search_news, search_books, and extract_content. This workflow is text-only; do not use "
-        "image search, include images, embed Markdown images, collect visual assets, or use direct "
-        "image URLs as report content. Use search_text/search_news/search_books for discovery and "
-        "extract_content to inspect selected URLs. If a tool returns an error, empty result, inaccessible page, "
-        "or low-quality output, preserve the exact error/result in your notes, use think_tool, "
-        "then retry with changed query terms, backend/source strategy, or mark the evidence gap "
-        "explicitly. Do not infer missing facts."
-    )
+    per_tool = _TOOL_GUIDANCE.get(tool_name, "")
+    guidance = per_tool + _SHARED_DDGS_GUIDANCE
     updated_description = description + guidance
     if hasattr(tool, "model_copy"):
         return tool.model_copy(update={"description": updated_description})

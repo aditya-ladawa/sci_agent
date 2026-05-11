@@ -11,7 +11,11 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
 from langchain.agents import create_agent
-from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware import (
+    ClearToolUsesEdit,
+    ContextEditingMiddleware,
+    TodoListMiddleware,
+)
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_openai import ChatOpenAI
@@ -30,11 +34,12 @@ from agent_arcs.mcp_and_tools import ddgs_mcp_tools
 
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 180
-AI_MODEL_TEMPERATURE = 0.05
-SUB_MODEL_TEMPERATURE = 0.7
+AI_MODEL_TEMPERATURE = 0.0
+SUB_MODEL_TEMPERATURE = 0.6
 OPENROUTER_PROMPT_CACHE_TTL = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "1h")
-MAIN_SUMMARIZATION_TRIGGER_TOKENS = int(262_000 * 0.85)
-SUBAGENT_SUMMARIZATION_TRIGGER_TOKENS = int(262_000 * 0.85)
+DEEP_CONTEXT_BUDGET_TOKENS = 262_000
+MAIN_SUMMARIZATION_TRIGGER_TOKENS = int(DEEP_CONTEXT_BUDGET_TOKENS * 0.80)
+SUBAGENT_SUMMARIZATION_TRIGGER_TOKENS = int(DEEP_CONTEXT_BUDGET_TOKENS * 0.80)
 SUMMARIZATION_KEEP_MESSAGES = 30
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DR_BENCH_ROOT = PROJECT_ROOT / "dr_bench"
@@ -92,16 +97,36 @@ def _format_tool_failure(error: Exception) -> str:
 
 @tool(parse_docstring=True)
 def think_tool(reflection: str) -> str:
-    """Tool for strategic reflection during long-running agent work.
+    """Tool for strategic reflection during long-running agent work. Use role-appropriately.
 
-    Use this as a lightweight checkpoint for concise status/evaluation notes. Do not write long
-    chains of reasoning here.
+    LeadResearcher: use think_tool to plan the research approach, assess task complexity,
+    choose subagent roles and budgets, and evaluate handoff completeness before synthesis or
+    re-delegation. Reflect after each handoff review to make delegation decisions explicit.
+
+    scout-agent / research-agent: use think_tool after each batch of search or extraction
+    results. Evaluate: did the results answer the assigned question? Are there clear gaps?
+    Do the sources look authoritative? Should the next query narrow, broaden, or switch
+    source type? This prevents chasing dead ends and ensures each step is informed.
+
+    Do NOT use think_tool to write long chains of reasoning or draft report content. Do NOT
+    use it as a substitute for writing status to files or todo items. Each reflection should
+    be a concise checkpoint, not a narrative.
 
     Args:
-        reflection: Concise operational reflection on progress, evidence quality, gaps, and next action.
+        reflection: Concise operational note on progress, evidence quality, gaps, and next action.
+                    Keep to 2-4 sentences for effective decision-making.
 
     Returns:
-        Confirmation that reflection was recorded for decision-making.
+        Confirmation that reflection was recorded.
+
+    Examples:
+        LeadResearcher: "Scout handoff received. 3 major dimensions identified (regulatory,
+        market, technical). Delegating research-agent for regulatory section with 6-call budget.
+        Market section has strong scout coverage -- may not need a separate pass."
+        Subagent: "First 2 search_text calls returned 15 candidate pages. 8 look authoritative
+        (WHO, NIH, academic journals), 4 are SEO aggregators (skip), 3 need inspection.
+        Gap: no primary data on EU market share. Next: extract_content on WHO page, then
+        search_news for EU regulation angle."
     """
     return f"Reflection recorded: {reflection}"
 
@@ -142,6 +167,16 @@ def _build_main_middleware(
                 "max_length": 2000,
                 "truncation_text": "...(argument truncated)",
             },
+        ),
+        ContextEditingMiddleware(
+            edits=[
+                ClearToolUsesEdit(
+                    trigger=200_000,
+                    keep=3,
+                    clear_tool_inputs=False,
+                    placeholder="[cleared]",
+                ),
+            ],
         ),
         PatchToolCallsMiddleware(),
         DiagnosticToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0, on_failure=_format_tool_failure),
@@ -235,6 +270,7 @@ __all__ = [
     "CHECKPOINTER_DB_PATH",
     "CONVERSATION_HISTORY_DIR",
     "DEFAULT_WORKSPACE_ROOT",
+    "DEEP_CONTEXT_BUDGET_TOKENS",
     "DR_BENCH_ROOT",
     "DRAFTS_DIR",
     "EVIDENCE_DIR",
