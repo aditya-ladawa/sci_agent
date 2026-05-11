@@ -272,6 +272,9 @@ def _clean_current_run_artifacts(*, paths: dict[str, Path], report_virtual_path:
 
 
 def _clean_eval_outputs(paths: dict[str, Path]) -> None:
+    cleaned_data_dir = paths["race"] / "cleaned_data"
+    if cleaned_data_dir.exists():
+        shutil.rmtree(cleaned_data_dir)
     for output in [
         paths["race"] / "raw_results.jsonl",
         paths["race"] / "race_result.txt",
@@ -289,6 +292,12 @@ def _clean_eval_outputs(paths: dict[str, Path]) -> None:
     ]:
         if output.exists():
             output.unlink()
+
+
+def _require_metric_keys(metrics: dict[str, float], *, path: Path, keys: set[str]) -> None:
+    missing = sorted(key for key in keys if key not in metrics)
+    if missing:
+        raise RuntimeError(f"Evaluation output {path} is missing required metric keys: {', '.join(missing)}")
 
 
 def _run_race(
@@ -337,7 +346,14 @@ def _run_race(
     _write_process_log(paths["race"] / "race_command.log", command, result)
     if result.returncode != 0:
         raise RuntimeError(f"RACE failed; see {paths['race'] / 'race_command.log'}")
-    return _parse_key_value_file(paths["race"] / "race_result.txt")
+    result_path = paths["race"] / "race_result.txt"
+    metrics = _parse_key_value_file(result_path)
+    _require_metric_keys(
+        metrics,
+        path=result_path,
+        keys={"Overall Score", "Comprehensiveness", "Insight", "Instruction Following", "Readability"},
+    )
+    return metrics
 
 
 def _run_fact(
@@ -435,7 +451,9 @@ def _run_fact(
                 f"see {paths['fact'] / f'fact_step_{index}.log'}"
             )
 
-    return _parse_key_value_file(result_path)
+    metrics = _parse_key_value_file(result_path)
+    _require_metric_keys(metrics, path=result_path, keys={"total_citations", "total_valid_citations", "valid_rate"})
+    return metrics
 
 
 def _write_benchmark_markdown(q_root: Path) -> None:
@@ -628,10 +646,29 @@ async def _run(args: argparse.Namespace) -> None:
 
         result = None
         article_text = ""
-        for attempt in range(1, 3):
+        try:
+            result = await _stream_run(
+                prompt=prompt,
+                thread_id=thread_id,
+                expected_report_path=report_virtual_path,
+                fail_on_incomplete_report=False,
+                langfuse_trace=langfuse_trace,
+            )
+        finally:
+            langfuse_trace.flush()
+        if result.report_path is None and args.continue_if_missing_report:
+            continuation_prompt = (
+                f"Your previous run ended incorrectly: the stream finished, but the required report file at {report_virtual_path} was never created. "
+                "Continue from the current checkpoint state. Fix that mistake now. Write the missing report file at the exact required path, "
+                "then verify that the file exists by checking it with the filesystem tools before you stop. Stop only after the report exists and ends with a final ## References section."
+            )
+            print(
+                f"report file not written at {report_virtual_path} on first attempt. "
+                "continuing once on same thread..."
+            )
             try:
                 result = await _stream_run(
-                    prompt=prompt,
+                    prompt=continuation_prompt,
                     thread_id=thread_id,
                     expected_report_path=report_virtual_path,
                     fail_on_incomplete_report=False,
@@ -639,30 +676,21 @@ async def _run(args: argparse.Namespace) -> None:
                 )
             finally:
                 langfuse_trace.flush()
-            if result.report_path is not None:
-                break
-            print(
-                f"report file not written at {report_virtual_path} after attempt {attempt}/2. "
-                "retrying on new thread..."
-            )
-            thread_id = (
-                f"{args.thread_id}-retry{attempt}"
-                if args.thread_id
-                else f"q{args.q_no}_{ARCH_TYPE}_{uuid.uuid4().hex[:12]}"
-            )
-            langfuse_trace.session_id = thread_id
-            langfuse_trace.trace_name = f"q{args.q_no}-{ARCH_TYPE}-{thread_id}"
-            langfuse_trace.metadata["thread_id"] = thread_id
         if result is None:
             raise RuntimeError("Agent did not run.")
         if result.report_path is None:
             raise RuntimeError(
-                f"Report file was not written after 2 attempts: {report_virtual_path}"
+                f"Report file was not written at {report_virtual_path}"
             )
         article_text = result.article_text
         report_path = result.report_path
         metrics_path = result.metrics_path
         run_id = result.run_id
+        from agent_arcs.deep_agent_arc.smoke_test import _report_placeholder_issues
+
+        placeholder_issues = _report_placeholder_issues(article_text)
+        if placeholder_issues and not args.skip_eval:
+            raise RuntimeError(f"Report at {report_path} is still a skeleton: {'; '.join(placeholder_issues)}")
 
     if not article_text.strip():
         raise RuntimeError("Agent did not produce article text for evaluation.")
@@ -688,13 +716,15 @@ async def _run(args: argparse.Namespace) -> None:
     race_metrics: dict[str, float] = {}
     fact_metrics: dict[str, float] = {}
     if not args.skip_eval:
+        if not args.skip_agent:
+            _clean_eval_outputs(paths)
         print("\nRunning RACE evaluation...")
         race_metrics = _run_race(
             q_no=args.q_no,
             question=question,
             article_text=article_text,
             paths=paths,
-            force=args.force_eval,
+            force=args.force_eval or not args.skip_agent,
         )
         print("Running FACT evaluation...")
         fact_metrics = _run_fact(
@@ -780,6 +810,7 @@ def main() -> None:
     parser.add_argument("--skip-agent", action="store_true", help="Reuse an existing report instead of running the agent.")
     parser.add_argument("--skip-eval", action="store_true", help="Skip RACE and FACT evaluation.")
     parser.add_argument("--force-eval", action="store_true", help="Remove prior RACE/FACT outputs before evaluating.")
+    parser.add_argument("--continue-if-missing-report", action="store_true", help="If a run finishes without writing the report file, continue once on the same checkpoint thread.")
     parser.add_argument("--langfuse", action="store_true", help="Enable optional Langfuse tracing for this run.")
     parser.add_argument("--langfuse-base-url", help="Langfuse base URL, default http://localhost:3000 or LANGFUSE_BASE_URL.")
     args = parser.parse_args()

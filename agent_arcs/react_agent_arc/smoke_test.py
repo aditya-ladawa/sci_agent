@@ -85,7 +85,11 @@ def _truncate(text: str, limit: int = 220) -> str:
 def _report_placeholder_issues(article_text: str) -> list[str]:
     lowered = article_text.lower()
     checks = {
-        "contains unfinished-section placeholder": "will be completed after all research",
+        "contains html placeholder comments": "<!-- placeholder",
+        "contains placeholder table cells": "| <!-- placeholder -->",
+        "contains placeholder marker": "placeholder",
+        "contains unfinished-after-research placeholder": "will be completed after all research",
+        "contains unfinished-after-sections placeholder": "will be completed after all sections",
         "contains unfinished-references placeholder": "references will be populated",
         "contains generic placeholder marker": "*this section will be completed",
     }

@@ -209,6 +209,7 @@ async def build_multi_agent_research_agent() -> AsyncIterator[Any]:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["AGENT_ARC_ACTIVE_ARCH"] = "multi"
     os.environ["MULTI_AGENT_WORKSPACE_ROOT"] = str(WORKSPACE_ROOT)
 
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINTER_DB_PATH)) as checkpointer:

@@ -13,6 +13,7 @@ DEFAULT_LANGFUSE_BASE_URL = "http://localhost:3000"
 DEFAULT_LANGFUSE_MAX_FIELD_CHARS = 4_000
 DEFAULT_LANGFUSE_MAX_COLLECTION_ITEMS = 20
 DEFAULT_LANGFUSE_ATTACH_SCORES_TO_TRACE = False
+DEFAULT_LANGFUSE_TRACE_NAMESPACE = "sci_agent_bm_final"
 
 
 def _max_field_chars() -> int:
@@ -37,6 +38,19 @@ def _truthy(value: str | None, *, default: bool = False) -> bool:
 
 def _attach_scores_to_trace() -> bool:
     return _truthy(os.getenv("LANGFUSE_ATTACH_SCORES_TO_TRACE"), default=DEFAULT_LANGFUSE_ATTACH_SCORES_TO_TRACE)
+
+
+def _langfuse_trace_namespace() -> str:
+    value = os.getenv("LANGFUSE_TRACE_NAMESPACE", DEFAULT_LANGFUSE_TRACE_NAMESPACE).strip()
+    return value or DEFAULT_LANGFUSE_TRACE_NAMESPACE
+
+
+def _langfuse_public_key() -> str | None:
+    return os.getenv("LANGFUSE_TRACING_PUBLIC_KEY") or os.getenv("LANGFUSE_PUBLIC_KEY")
+
+
+def _langfuse_secret_key() -> str | None:
+    return os.getenv("LANGFUSE_TRACING_SECRET_KEY") or os.getenv("LANGFUSE_SECRET_KEY")
 
 
 def _truncate_text(value: str, *, max_chars: int) -> str:
@@ -408,8 +422,9 @@ def configure_langfuse(
     resolved_base_url = base_url or os.getenv("LANGFUSE_BASE_URL") or DEFAULT_LANGFUSE_BASE_URL
     session_id = thread_id
     trace_name = f"q{q_no}-{architecture}-{thread_id}"
+    trace_namespace = _langfuse_trace_namespace()
     tags = [
-        "sci_agent_bm",
+        trace_namespace,
         "benchmark",
         f"architecture:{architecture}",
         f"question:q{q_no}",
@@ -419,6 +434,7 @@ def configure_langfuse(
         "architecture": architecture,
         "question_id": str(q_no),
         "thread_id": thread_id,
+        "trace_namespace": trace_namespace,
     }
 
     if not requested:
@@ -438,13 +454,22 @@ def configure_langfuse(
         os.environ.setdefault("LANGFUSE_BASE_URL", resolved_base_url)
         os.environ.setdefault("LANGFUSE_HOST", resolved_base_url)
 
-    missing = [name for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY") if not os.getenv(name)]
+    public_key = _langfuse_public_key()
+    secret_key = _langfuse_secret_key()
+    missing = [
+        name
+        for name, value in (("LANGFUSE_TRACING_PUBLIC_KEY or LANGFUSE_PUBLIC_KEY", public_key), ("LANGFUSE_TRACING_SECRET_KEY or LANGFUSE_SECRET_KEY", secret_key))
+        if not value
+    ]
     if missing:
         raise RuntimeError(
             "Langfuse tracing requested but missing environment variables: "
             + ", ".join(missing)
             + ". Create a Langfuse project and export its public/secret keys."
         )
+
+    os.environ["LANGFUSE_PUBLIC_KEY"] = public_key or ""
+    os.environ["LANGFUSE_SECRET_KEY"] = secret_key or ""
 
     try:
         from langfuse import get_client

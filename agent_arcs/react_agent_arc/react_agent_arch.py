@@ -131,7 +131,13 @@ def _build_model(model_name: str, temperature: float) -> ChatOpenAI:
 
 def _current_workspace_root() -> Path:
     # Multi-agent reuses these file tools, so resolve the active runtime workspace at call time.
-    workspace = os.getenv("MULTI_AGENT_WORKSPACE_ROOT") or os.getenv("REACT_AGENT_WORKSPACE_ROOT")
+    active_arch = os.getenv("AGENT_ARC_ACTIVE_ARCH")
+    if active_arch == "multi":
+        workspace = os.getenv("MULTI_AGENT_WORKSPACE_ROOT")
+    elif active_arch == "react":
+        workspace = os.getenv("REACT_AGENT_WORKSPACE_ROOT")
+    else:
+        workspace = os.getenv("REACT_AGENT_WORKSPACE_ROOT") or os.getenv("MULTI_AGENT_WORKSPACE_ROOT")
     return Path(workspace or str(DEFAULT_WORKSPACE_ROOT)).resolve()
 
 
@@ -390,9 +396,9 @@ def search_files(pattern: str, path: str = "/", file_pattern: str | None = None)
         if not base_path.exists():
             return "No matches found."
 
-        search_root = base_path if base_path.is_dir() else base_path.parent
+        candidates = [base_path] if base_path.is_file() else base_path.rglob("*")
         results: list[str] = []
-        for candidate in search_root.rglob("*"):
+        for candidate in candidates:
             if not candidate.is_file():
                 continue
             if file_pattern and not candidate.match(file_pattern):
@@ -485,6 +491,7 @@ async def build_react_research_agent() -> AsyncIterator[Any]:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["AGENT_ARC_ACTIVE_ARCH"] = "react"
 
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINTER_DB_PATH)) as checkpointer:
         await checkpointer.setup()
